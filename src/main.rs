@@ -14,6 +14,7 @@ const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(0xAA, 0xAA, 0xAA);
 const DISABLED_BORDER: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
 const CLEAR_RED: egui::Color32 = egui::Color32::from_rgb(0xAB, 0x00, 0x00);
 const BTN_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
+const RESET_GREEN: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x8A, 0x2A);
 
 // ─── Config persistence ──────────────────────────────────────────────────────
 fn config_path() -> PathBuf {
@@ -29,6 +30,7 @@ struct Config {
     interval: String,
     timer_count: String,
     sound_file: String,
+    final_sound_file: String,
     progress_bar_mode: bool,
 }
 
@@ -42,6 +44,7 @@ impl Config {
                     interval: conf.get("Settings", "interval").unwrap_or_default(),
                     timer_count: conf.get("Settings", "timer_count").unwrap_or_default(),
                     sound_file: conf.get("Settings", "sound_file").unwrap_or_default(),
+                    final_sound_file: conf.get("Settings", "final_sound_file").unwrap_or_default(),
                     progress_bar_mode: conf
                         .get("Settings", "progress_bar_mode")
                         .unwrap_or_default()
@@ -57,6 +60,7 @@ impl Config {
         conf.set("Settings", "interval", Some(self.interval.clone()));
         conf.set("Settings", "timer_count", Some(self.timer_count.clone()));
         conf.set("Settings", "sound_file", Some(self.sound_file.clone()));
+        conf.set("Settings", "final_sound_file", Some(self.final_sound_file.clone()));
         conf.set(
             "Settings",
             "progress_bar_mode",
@@ -72,6 +76,7 @@ impl Default for Config {
             interval: String::new(),
             timer_count: String::new(),
             sound_file: String::new(),
+            final_sound_file: String::new(),
             progress_bar_mode: false,
         }
     }
@@ -105,7 +110,7 @@ impl AudioPlayer {
         self.sound_path = Some(path);
     }
 
-    fn play_looping(&mut self) {
+    fn play_once(&mut self) {
         self.stop();
         if let Some(path) = &self.sound_path {
             if let Ok(file) = std::fs::File::open(path) {
@@ -113,8 +118,7 @@ impl AudioPlayer {
                 if let Ok(source) = rodio::Decoder::new(reader) {
                     let sink = rodio::Sink::try_new(&self.stream_handle).ok();
                     if let Some(ref s) = sink {
-                        use rodio::Source;
-                        s.append(source.repeat_infinite());
+                        s.append(source);
                         s.play();
                     }
                     self.sink = sink;
@@ -186,6 +190,44 @@ impl AudioPlayer {
     fn is_playing(&self) -> bool {
         self.sink.as_ref().is_some_and(|s| !s.empty())
     }
+
+    fn play_file(&mut self, path: &std::path::Path) {
+        self.stop();
+        if let Ok(file) = std::fs::File::open(path) {
+            let reader = std::io::BufReader::new(file);
+            if let Ok(source) = rodio::Decoder::new(reader) {
+                let sink = rodio::Sink::try_new(&self.stream_handle).ok();
+                if let Some(ref s) = sink {
+                    s.append(source);
+                    s.play();
+                }
+                self.sink = sink;
+            }
+        }
+    }
+
+    fn preview_file(&mut self, path: &std::path::Path) {
+        if self.preview_start.is_some() && self.is_playing() {
+            return;
+        }
+        self.stop();
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let reader = std::io::BufReader::new(file);
+        let source = match rodio::Decoder::new(reader) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if let Ok(sink) = rodio::Sink::try_new(&self.stream_handle) {
+            sink.set_volume(0.0);
+            sink.append(source);
+            sink.play();
+            self.sink = Some(sink);
+            self.preview_start = Some(Instant::now());
+        }
+    }
 }
 
 // ─── Timer ───────────────────────────────────────────────────────────────────
@@ -195,7 +237,6 @@ struct Timer {
     remaining_seconds: f64,
     is_active: bool,
     is_alerting: bool,
-    alert_duration_remaining: f64,
     marked_for_removal: bool,
 }
 
@@ -207,7 +248,6 @@ impl Timer {
             remaining_seconds: duration_seconds,
             is_active: false,
             is_alerting: false,
-            alert_duration_remaining: 60.0,
             marked_for_removal: false,
         }
     }
@@ -225,11 +265,6 @@ impl Timer {
                     self.is_alerting = true;
                     return true;
                 }
-            }
-        } else if self.is_alerting {
-            self.alert_duration_remaining -= dt_seconds; // Alert not affected by speed
-            if self.alert_duration_remaining <= 0.0 {
-                self.silence();
             }
         }
         false
@@ -348,7 +383,15 @@ struct CascadingTimersApp {
     // Audio
     audio: Option<AudioPlayer>,
     sound_file_display: String,
-    audio_timeout_start: Option<Instant>,
+    final_sound_file_display: String,
+    final_sound_path: Option<PathBuf>,
+    current_alert_path: Option<PathBuf>,
+
+    // Repeat alert
+    repeat_alert_enabled: bool,
+    repeat_alert_count: u32,
+    repeat_alert_count_str: String,
+    alert_plays_remaining: u32,
 
     // Config
     config: Config,
@@ -357,6 +400,8 @@ struct CascadingTimersApp {
     pending_clear: bool,
     needs_rebuild: bool,
     timers_running: bool,
+    all_timers_completed: bool,
+    completed_timer_durations: Vec<f64>,
 }
 
 const FONT_BOLD: &str = "app-bold";
@@ -440,6 +485,19 @@ impl CascadingTimersApp {
             }
         }
 
+        let mut final_sound_display = String::new();
+        let mut final_sound_path = None;
+        if !config.final_sound_file.is_empty() {
+            let path = PathBuf::from(&config.final_sound_file);
+            if path.exists() {
+                final_sound_display = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                final_sound_path = Some(path);
+            }
+        }
+
         Self {
             input_interval: String::new(),
             input_count: String::new(),
@@ -464,13 +522,22 @@ impl CascadingTimersApp {
 
             audio,
             sound_file_display: sound_display,
-            audio_timeout_start: None,
+            final_sound_file_display: final_sound_display,
+            final_sound_path,
+            current_alert_path: None,
+
+            repeat_alert_enabled: false,
+            repeat_alert_count: 1,
+            repeat_alert_count_str: "1".to_string(),
+            alert_plays_remaining: 0,
 
             config,
 
             pending_clear: false,
             needs_rebuild: false,
             timers_running: false,
+            all_timers_completed: false,
+            completed_timer_durations: Vec::new(),
         }
     }
 
@@ -618,6 +685,8 @@ impl CascadingTimersApp {
             self.timers.push(Timer::new(id, duration));
         }
 
+        self.completed_timer_durations = self.timers.iter().map(|t| t.total_seconds).collect();
+
         // Save to config
         if interval_s > 0.0 {
             self.config.interval = format!("{}", interval_s as u64);
@@ -639,6 +708,7 @@ impl CascadingTimersApp {
         }
         self.is_paused = false;
         self.timers_running = true;
+        self.all_timers_completed = false;
     }
 
     fn pause_all(&mut self) {
@@ -656,15 +726,27 @@ impl CascadingTimersApp {
             t.remaining_seconds = t.total_seconds;
             t.is_active = false;
             t.is_alerting = false;
-            t.alert_duration_remaining = 60.0;
             t.marked_for_removal = false;
         }
+    }
+
+    fn restore_timers(&mut self) {
+        self.stop_sound();
+        self.timers.clear();
+        for &dur in &self.completed_timer_durations {
+            let id = self.next_timer_id;
+            self.next_timer_id += 1;
+            self.timers.push(Timer::new(id, dur));
+        }
+        self.is_paused = true;
+        self.all_timers_completed = false;
     }
 
     fn clear_all(&mut self) {
         self.pause_all();
         self.timers.clear();
         self.timers_running = false;
+        self.all_timers_completed = false;
         self.input_count.clear();
         self.input_duration.clear();
         self.input_offset.clear();
@@ -684,17 +766,50 @@ impl CascadingTimersApp {
             }
         }
         if newly_alerting {
+            let is_final = self.timers.iter().all(|t| t.is_alerting || t.marked_for_removal);
             self.stop_sound();
-            self.play_sound();
+            if !self.play_sound(is_final) {
+                self.silence_alerting_timers();
+            }
         }
     }
 
-    fn play_sound(&mut self) {
+    fn play_sound(&mut self, is_final: bool) -> bool {
+        let path = if is_final && self.final_sound_path.is_some() {
+            self.final_sound_path.clone()
+        } else {
+            self.audio.as_ref().and_then(|a| a.sound_path.clone())
+        };
+
+        let Some(path) = path else { return false };
+
+        if self.audio.as_ref().is_some_and(|a| a.is_playing()) {
+            return true;
+        }
+
         if let Some(ref mut audio) = self.audio {
-            if !audio.is_playing() {
-                audio.play_looping();
-                self.audio_timeout_start = Some(Instant::now());
+            audio.play_file(&path);
+        }
+
+        self.current_alert_path = Some(path);
+        self.alert_plays_remaining = if self.repeat_alert_enabled {
+            self.repeat_alert_count
+        } else {
+            0
+        };
+        true
+    }
+
+    fn silence_alerting_timers(&mut self) {
+        for t in &mut self.timers {
+            if t.is_alerting {
+                t.silence();
             }
+        }
+        self.timers.retain(|t| !t.marked_for_removal);
+        if self.timers.is_empty() && self.timers_running {
+            self.all_timers_completed = true;
+            self.timers_running = false;
         }
     }
 
@@ -702,7 +817,8 @@ impl CascadingTimersApp {
         if let Some(ref mut audio) = self.audio {
             audio.stop();
         }
-        self.audio_timeout_start = None;
+        self.alert_plays_remaining = 0;
+        self.current_alert_path = None;
     }
 
     fn process_tick(&mut self) {
@@ -731,23 +847,55 @@ impl CascadingTimersApp {
         // Remove silenced timers
         self.timers.retain(|t| !t.marked_for_removal);
 
+        if self.timers.is_empty() && self.timers_running {
+            self.all_timers_completed = true;
+            self.timers_running = false;
+        }
+
         // Sound management (don't interfere with preview)
         let preview_active = self
             .audio
             .as_ref()
             .is_some_and(|a| a.preview_start.is_some());
         if any_new_alert {
+            // New timer fired: stop current sound, play for the new alert
+            let is_final = self.timers.iter().all(|t| t.is_alerting || t.marked_for_removal);
             self.stop_sound();
-            self.play_sound();
+            if !self.play_sound(is_final) {
+                // No alert sound selected — auto-silence instead of leaving timers in alert state
+                self.silence_alerting_timers();
+            }
+        } else if any_alerting && !preview_active {
+            // Check if sound finished playing
+            let sound_playing = self.audio.as_ref().is_some_and(|a| a.is_playing());
+            if !sound_playing {
+                if self.alert_plays_remaining > 0 {
+                    // Repeat the alert sound using the same sound as the initial alert
+                    self.alert_plays_remaining -= 1;
+                    let replay_path = self.current_alert_path.clone();
+                    if let Some(ref mut audio) = self.audio {
+                        if let Some(ref path) = replay_path {
+                            audio.play_file(path);
+                        } else {
+                            audio.play_once();
+                        }
+                    }
+                } else {
+                    // All plays done — silence alerting timers
+                    for t in &mut self.timers {
+                        if t.is_alerting {
+                            t.silence();
+                        }
+                    }
+                    self.timers.retain(|t| !t.marked_for_removal);
+                    if self.timers.is_empty() && self.timers_running {
+                        self.all_timers_completed = true;
+                        self.timers_running = false;
+                    }
+                }
+            }
         } else if !any_alerting && !preview_active {
             self.stop_sound();
-        }
-
-        // 4-minute audio timeout
-        if let Some(start) = self.audio_timeout_start {
-            if now.duration_since(start) > Duration::from_secs(240) {
-                self.stop_sound();
-            }
         }
     }
 }
@@ -804,7 +952,7 @@ impl eframe::App for CascadingTimersApp {
             self.rebuild_timers();
             let new_count = self.timers.len();
             if new_count != old_count {
-                const BASE_HEIGHT: f32 = 340.0;
+                const BASE_HEIGHT: f32 = 375.0;
                 const PER_TIMER: f32 = 46.0;
                 let target = (BASE_HEIGHT + new_count as f32 * PER_TIMER).clamp(400.0, 1200.0);
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
@@ -939,12 +1087,15 @@ impl eframe::App for CascadingTimersApp {
                 // ── Display mode + Time adjust ──
                 ui.horizontal(|ui| {
                     let mut pb = self.progress_bar_mode;
+                    let old_pad = ui.spacing().button_padding;
+                    ui.spacing_mut().button_padding.y = 3.5;
                     let cb = ui.checkbox(
                         &mut pb,
                         egui::RichText::new("Show Progress Bars")
                             .color(TEXT_WHITE)
                             .size(12.0),
                     );
+                    ui.spacing_mut().button_padding = old_pad;
                     if cb.changed() {
                         self.progress_bar_mode = pb;
                         self.config.progress_bar_mode = pb;
@@ -992,17 +1143,33 @@ impl eframe::App for CascadingTimersApp {
                     }
                     reset_resp.on_hover_text("Reset all timers");
 
-                    let clear_btn = egui::Button::new(
-                        egui::RichText::new("Clear All")
-                            .color(TEXT_WHITE)
-                            .family(egui::FontFamily::Name(FONT_BOLD.into()))
-                            .size(14.0),
-                    )
-                    .fill(CLEAR_RED)
-                    .corner_radius(4.0)
-                    .min_size(egui::vec2(btn_width, 30.0));
-                    if ui.add(clear_btn).clicked() {
-                        self.pending_clear = true;
+                    if self.all_timers_completed {
+                        let reset_all_btn = egui::Button::new(
+                            egui::RichText::new("Reset All")
+                                .color(TEXT_WHITE)
+                                .family(egui::FontFamily::Name(FONT_BOLD.into()))
+                                .size(14.0),
+                        )
+                        .fill(RESET_GREEN)
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(4.0)
+                        .min_size(egui::vec2(btn_width, 30.0));
+                        if ui.add(reset_all_btn).clicked() {
+                            self.restore_timers();
+                        }
+                    } else {
+                        let clear_btn = egui::Button::new(
+                            egui::RichText::new("Clear All")
+                                .color(TEXT_WHITE)
+                                .family(egui::FontFamily::Name(FONT_BOLD.into()))
+                                .size(14.0),
+                        )
+                        .fill(CLEAR_RED)
+                        .corner_radius(4.0)
+                        .min_size(egui::vec2(btn_width, 30.0));
+                        if ui.add(clear_btn).clicked() {
+                            self.pending_clear = true;
+                        }
                     }
                 });
 
@@ -1104,7 +1271,7 @@ impl eframe::App for CascadingTimersApp {
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
-                    .max_height(ui.available_height() - 60.0)
+                    .max_height(ui.available_height() - 100.0)
                     .show(ui, |ui| {
                         let mut silence_ids = Vec::new();
                         let mut cancel_ids = Vec::new();
@@ -1230,6 +1397,7 @@ impl eframe::App for CascadingTimersApp {
 
                 // ── Sound Section (bottom) ──
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    // Row 1 (bottommost): Regular alert button + Preview + Repeat controls
                     ui.horizontal(|ui| {
                         if secondary_button(ui, "Select Alert Sound...").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
@@ -1257,14 +1425,141 @@ impl eframe::App for CascadingTimersApp {
                                 }
                             }
                         });
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.repeat_alert_enabled {
+                                ui.label(
+                                    egui::RichText::new("x")
+                                        .color(TEXT_WHITE)
+                                        .size(12.0),
+                                );
+
+                                let te = egui::TextEdit::singleline(&mut self.repeat_alert_count_str)
+                                    .desired_width(20.0)
+                                    .horizontal_align(egui::Align::Center)
+                                    .font(egui::TextStyle::Body);
+                                let response = ui.add(te);
+
+                                if response.has_focus() {
+                                    let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                                    let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                                    if up {
+                                        self.repeat_alert_count = self.repeat_alert_count.saturating_add(1);
+                                        self.repeat_alert_count_str = self.repeat_alert_count.to_string();
+                                    }
+                                    if down && self.repeat_alert_count > 1 {
+                                        self.repeat_alert_count -= 1;
+                                        self.repeat_alert_count_str = self.repeat_alert_count.to_string();
+                                    }
+                                }
+
+                                if response.changed() {
+                                    if let Ok(n) = self.repeat_alert_count_str.trim().parse::<u32>() {
+                                        if n >= 1 {
+                                            self.repeat_alert_count = n;
+                                        }
+                                    }
+                                }
+
+                                if response.lost_focus() {
+                                    self.repeat_alert_count_str = self.repeat_alert_count.to_string();
+                                }
+                            }
+
+                            let old_pad = ui.spacing().button_padding;
+                            ui.spacing_mut().button_padding.y = 3.5;
+                            ui.checkbox(
+                                &mut self.repeat_alert_enabled,
+                                egui::RichText::new("Repeat Alert?")
+                                    .color(TEXT_WHITE)
+                                    .size(12.0),
+                            );
+                            ui.spacing_mut().button_padding = old_pad;
+                        });
                     });
 
-                    ui.label(
-                        egui::RichText::new(&self.sound_file_display)
-                            .color(TEXT_DIM)
-                            .italics()
-                            .size(11.0),
-                    );
+                    // Row 2: Final alert button + Preview
+                    ui.horizontal(|ui| {
+                        if secondary_button(ui, "Select Final Alert (optional)...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Audio Files", &["wav", "mp3"])
+                                .pick_file()
+                            {
+                                self.final_sound_file_display = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "Unknown".to_string());
+                                self.config.final_sound_file = path.to_string_lossy().to_string();
+                                self.config.save();
+                                self.final_sound_path = Some(path);
+                            }
+                        }
+
+                        let has_final_sound = self.final_sound_path.is_some();
+                        ui.add_enabled_ui(has_final_sound, |ui| {
+                            if secondary_button(ui, "Preview").clicked() {
+                                if let Some(path) = self.final_sound_path.clone() {
+                                    if let Some(ref mut audio) = self.audio {
+                                        audio.preview_file(&path);
+                                    }
+                                }
+                            }
+                        });
+                    });
+
+                    // Row 3: Regular sound name label (with optional ⛔ clear button)
+                    ui.horizontal(|ui| {
+                        let has_regular_sound =
+                            self.audio.as_ref().is_some_and(|a| a.sound_path.is_some());
+                        if has_regular_sound {
+                            let clear = egui::Label::new(
+                                egui::RichText::new("⛔").size(11.0),
+                            )
+                            .selectable(false)
+                            .sense(egui::Sense::click());
+                            let resp = ui.add(clear).on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if resp.on_hover_text("Clear alert sound").clicked() {
+                                self.config.sound_file = String::new();
+                                self.config.save();
+                                self.sound_file_display.clear();
+                                if let Some(ref mut audio) = self.audio {
+                                    audio.sound_path = None;
+                                }
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(&self.sound_file_display)
+                                .color(TEXT_DIM)
+                                .italics()
+                                .size(11.0),
+                        );
+                    });
+
+                    // Row 4 (topmost): Final sound name (with ⛔ clear) or reserved blank space
+                    if self.final_sound_path.is_some() {
+                        ui.horizontal(|ui| {
+                            let clear = egui::Label::new(
+                                egui::RichText::new("⛔").size(11.0),
+                            )
+                            .selectable(false)
+                            .sense(egui::Sense::click());
+                            let resp = ui.add(clear).on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if resp.on_hover_text("Clear final alert sound").clicked() {
+                                self.config.final_sound_file = String::new();
+                                self.config.save();
+                                self.final_sound_file_display.clear();
+                                self.final_sound_path = None;
+                            }
+                            ui.label(
+                                egui::RichText::new(&self.final_sound_file_display)
+                                    .color(TEXT_DIM)
+                                    .italics()
+                                    .size(11.0),
+                            );
+                        });
+                    } else {
+                        ui.allocate_space(egui::vec2(ui.available_width(), 15.0));
+                    }
                 });
             });
     }
