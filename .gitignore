@@ -1,0 +1,34 @@
+# Build output
+build/
+dist/
+target/
+
+# Compiled binaries
+*.exe
+
+# Local config and runtime data
+config.ini
+*.local.ini
+
+# Logs
+*.log
+
+# Python cache / local virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local project meta (machine-specific; not for the public repo)
+.claude/
+get-project-context.ps1
+to-do.txt
+to add.txt
+*.lnk
