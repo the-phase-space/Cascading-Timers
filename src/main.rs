@@ -422,6 +422,7 @@ fn load_system_font(filename: &str) -> Option<Vec<u8>> {
 impl CascadingTimersApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let config = Config::load();
 
         let mut audio = AudioPlayer::new();
@@ -648,6 +649,18 @@ impl CascadingTimersApp {
         self.stop_sound();
     }
 
+    fn reset_all(&mut self) {
+        self.stop_sound();
+        self.is_paused = true;
+        for t in &mut self.timers {
+            t.remaining_seconds = t.total_seconds;
+            t.is_active = false;
+            t.is_alerting = false;
+            t.alert_duration_remaining = 60.0;
+            t.marked_for_removal = false;
+        }
+    }
+
     fn clear_all(&mut self) {
         self.pause_all();
         self.timers.clear();
@@ -826,7 +839,7 @@ impl eframe::App for CascadingTimersApp {
                 ui.group(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
 
-                    let placeholder = "e.g. 1h 30m, 0:10:00, 90 (=90m)";
+                    let placeholder = "e.g. 1.5m, 3.75h, 0:10:00, 90 (=90m)";
                     let mut fields_changed = false;
 
                     // Interval
@@ -839,7 +852,7 @@ impl eframe::App for CascadingTimersApp {
                         let r = ui.add_sized([ui.available_width(), 24.0], te);
                         if r.changed() {
                             self.input_interval
-                                .retain(|c| c.is_ascii_digit() || "hmsHMS: ".contains(c));
+                                .retain(|c| c.is_ascii_digit() || ".hmsHMS: ".contains(c));
                             fields_changed = true;
                         }
                     });
@@ -875,7 +888,7 @@ impl eframe::App for CascadingTimersApp {
                         let r = ui.add_sized([ui.available_width(), 24.0], te);
                         if r.changed() {
                             self.input_duration
-                                .retain(|c| c.is_ascii_digit() || "hmsHMS: ".contains(c));
+                                .retain(|c| c.is_ascii_digit() || ".hmsHMS: ".contains(c));
                             fields_changed = true;
                         }
                     });
@@ -891,7 +904,7 @@ impl eframe::App for CascadingTimersApp {
                         let r = ui.add_sized([ui.available_width(), 24.0], te);
                         if r.changed() {
                             self.input_offset
-                                .retain(|c| c.is_ascii_digit() || "hmsHMS: ".contains(c));
+                                .retain(|c| c.is_ascii_digit() || ".hmsHMS: ".contains(c));
                             fields_changed = true;
                         }
                     });
@@ -950,7 +963,10 @@ impl eframe::App for CascadingTimersApp {
 
                 // ── Controls ──
                 ui.horizontal(|ui| {
-                    let btn_width = (ui.available_width() - 16.0) / 3.0;
+                    let reset_width = 34.0;
+                    let spacing = ui.spacing().item_spacing.x;
+                    let btn_width =
+                        (ui.available_width() - spacing * 3.0 - reset_width) / 3.0;
 
                     if accent_button_sized(ui, "Start All", egui::vec2(btn_width, 30.0)).clicked()
                     {
@@ -960,6 +976,21 @@ impl eframe::App for CascadingTimersApp {
                     {
                         self.pause_all();
                     }
+
+                    // Reset button with replay icon
+                    let reset_icon = egui::Image::new(
+                        egui::include_image!("../assets/replay.svg"),
+                    )
+                    .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                    .tint(TEXT_WHITE);
+                    let reset_btn = egui::Button::image(reset_icon)
+                        .fill(ACCENT)
+                        .corner_radius(4.0);
+                    let reset_resp = ui.add_sized(egui::vec2(reset_width, 30.0), reset_btn);
+                    if reset_resp.clicked() {
+                        self.reset_all();
+                    }
+                    reset_resp.on_hover_text("Reset all timers");
 
                     let clear_btn = egui::Button::new(
                         egui::RichText::new("Clear All")
@@ -1099,6 +1130,12 @@ impl eframe::App for CascadingTimersApp {
                                 .outer_margin(egui::Margin::symmetric(0, 2))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
+                                        let action_button_width = if timer.is_alerting { 74.0 } else { 30.0 };
+                                        let spacing = ui.spacing().item_spacing.x;
+                                        let content_width =
+                                            (ui.available_width() - action_button_width - spacing)
+                                                .max(0.0);
+
                                         match display_mode {
                                             1 => {
                                                 // Progress bar for next timer
@@ -1106,15 +1143,12 @@ impl eframe::App for CascadingTimersApp {
                                                     timer.fraction_remaining(),
                                                 )
                                                 .fill(ACCENT);
-                                                ui.add_sized(
-                                                    [ui.available_width() - 40.0, 20.0],
-                                                    pbar,
-                                                );
+                                                ui.add_sized([content_width, 20.0], pbar);
                                             }
                                             2 => {
                                                 // Dimmed interval label
                                                 ui.add_sized(
-                                                    [ui.available_width() - 40.0, 20.0],
+                                                    [content_width, 20.0],
                                                     egui::Label::new(
                                                         egui::RichText::new(&interval_label)
                                                             .color(TEXT_DIM)
@@ -1143,7 +1177,7 @@ impl eframe::App for CascadingTimersApp {
                                                         .size(16.0)
                                                 };
                                                 ui.add_sized(
-                                                    [ui.available_width() - 40.0, 20.0],
+                                                    [content_width, 20.0],
                                                     egui::Label::new(text),
                                                 );
                                             }
@@ -1158,8 +1192,9 @@ impl eframe::App for CascadingTimersApp {
                                                     )),
                                             )
                                             .fill(TEXT_WHITE)
-                                            .corner_radius(3.0);
-                                            if ui.add(btn).clicked() {
+                                            .corner_radius(3.0)
+                                            .min_size(egui::vec2(action_button_width, 20.0));
+                                            if ui.add_sized([action_button_width, 20.0], btn).clicked() {
                                                 silence_ids.push(timer.id);
                                             }
                                         } else {
@@ -1172,8 +1207,8 @@ impl eframe::App for CascadingTimersApp {
                                             )
                                             .fill(ACCENT)
                                             .corner_radius(3.0)
-                                            .min_size(egui::vec2(30.0, 20.0));
-                                            if ui.add(btn).clicked() {
+                                            .min_size(egui::vec2(action_button_width, 20.0));
+                                            if ui.add_sized([action_button_width, 20.0], btn).clicked() {
                                                 cancel_ids.push(timer.id);
                                             }
                                         }
@@ -1256,21 +1291,24 @@ fn main() -> eframe::Result {
 }
 
 fn load_icon() -> egui::IconData {
-    // Try to load the .ico from parent directory (project root)
-    let ico_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()))
-        .map(|p| p.join("Untitled-5(1).ico"));
-
-    if let Some(path) = ico_path {
-        if let Ok(img) = image::open(&path) {
-            let rgba = img.to_rgba8();
-            let (w, h) = rgba.dimensions();
-            return egui::IconData {
-                rgba: rgba.into_raw(),
-                width: w,
-                height: h,
-            };
+    // Try current exe directory, then parent directories.
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(mut dir) = exe_path.parent().map(|p| p.to_path_buf()) {
+            for _ in 0..5 {
+                let path = dir.join("Untitled-5(1).ico");
+                if let Ok(img) = image::open(&path) {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    return egui::IconData {
+                        rgba: rgba.into_raw(),
+                        width: w,
+                        height: h,
+                    };
+                }
+                if !dir.pop() {
+                    break;
+                }
+            }
         }
     }
 
