@@ -142,7 +142,9 @@ class TimerWidget(QFrame):
         self.btn_cancel.hide()
         self.btn_silence.show()
         self.update_display()
-        # Parent window handles the actual sound playing to ensure 1 sound at a time
+        # Parent window handles sound
+        if self.parent_window:
+            self.parent_window.on_timer_alert(self)
 
     def silence(self):
         self.is_alerting = False
@@ -272,11 +274,21 @@ class MainWindow(QMainWindow):
         h_total.addWidget(self.input_duration)
         settings_layout.addLayout(h_total)
 
+        # Row 2.5: Offset
+        h_offset = QHBoxLayout()
+        h_offset.addWidget(QLabel("Offset (First Timer):"))
+        self.input_offset = QLineEdit()
+        self.input_offset.setPlaceholderText("HH:MM:SS")
+        self.input_offset.textChanged.connect(self.on_settings_change)
+        h_offset.addWidget(self.input_offset)
+        settings_layout.addLayout(h_offset)
+
         main_layout.addWidget(settings_frame)
 
-        # Row 3: Display Mode - Moved out of settings_frame for visibility
+        # Row 3: Display Mode and Time Adjust
+        h_controls_extra = QHBoxLayout()
+        
         self.chk_progressbar = QCheckBox("Show Progress Bars (No Text)")
-        # Checkbox style
         self.chk_progressbar.setStyleSheet("""
             QCheckBox { color: white; spacing: 5px; }
             QCheckBox::indicator { width: 13px; height: 13px; border: 1px solid #fc035e; }
@@ -284,7 +296,21 @@ class MainWindow(QMainWindow):
         """)
         self.chk_progressbar.setChecked(self.config['Settings'].getboolean('progress_bar_mode', False))
         self.chk_progressbar.toggled.connect(self.on_display_mode_changed)
-        main_layout.addWidget(self.chk_progressbar) # Added directly to main layout
+        h_controls_extra.addWidget(self.chk_progressbar)
+        
+        h_controls_extra.addStretch()
+        
+        btn_minus = QPushButton("-15s")
+        btn_minus.setFixedWidth(50)
+        btn_minus.clicked.connect(lambda: self.adjust_time(-15))
+        h_controls_extra.addWidget(btn_minus)
+        
+        btn_plus = QPushButton("+15s")
+        btn_plus.setFixedWidth(50)
+        btn_plus.clicked.connect(lambda: self.adjust_time(15))
+        h_controls_extra.addWidget(btn_plus)
+        
+        main_layout.addLayout(h_controls_extra)
 
         # --- Controls ---
         controls_layout = QHBoxLayout()
@@ -350,6 +376,12 @@ class MainWindow(QMainWindow):
         self.preview_timer = QTimer()
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self.stop_preview)
+        
+        # Audio timeout (4 minutes)
+        self.audio_timeout_timer = QTimer()
+        self.audio_timeout_timer.setSingleShot(True)
+        self.audio_timeout_timer.setInterval(4 * 60 * 1000) # 4 minutes
+        self.audio_timeout_timer.timeout.connect(self.stop_sound)
 
         sound_path = self.config['Settings'].get('sound_file', '')
         if sound_path and os.path.exists(sound_path):
@@ -380,16 +412,25 @@ class MainWindow(QMainWindow):
         self.player.stop()
 
     def play_sound(self):
+        # Called when alert should be playing
         if self.player.source().isValid():
             if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
                 self.player.setLoops(QMediaPlayer.Loops.Infinite)
                 self.player.play()
+                self.audio_timeout_timer.start() # Start 4 min timeout
         else:
             QApplication.beep()
 
     def stop_sound(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.stop()
+        self.audio_timeout_timer.stop()
+
+    def on_timer_alert(self, timer_widget):
+        # Called by TimerWidget when it STARTS alerting
+        # Reset sound logic (restart sound if stopped, or refresh timeout)
+        self.stop_sound()
+        self.play_sound()
 
     def parse_time_str(self, time_str):
         total = 0
@@ -429,6 +470,27 @@ class MainWindow(QMainWindow):
         return f"{seconds}s"
 
     # --- Logic ---
+    
+    def adjust_time(self, delta_seconds):
+        # Subtract/Add time to all NONZERO timers
+        for t in self.timers:
+            if t.remaining_seconds > 0:
+                new_time = t.remaining_seconds + delta_seconds
+                if new_time < 0:
+                    new_time = 0
+                t.remaining_seconds = new_time
+                t.update_display()
+                # If it hit 0, it will trigger alert on next global tick?
+                # or we can force check?
+                # tick() logic: if rem > 0 -> rem -= 1 ... if rem == 0 -> alert.
+                # If we set rem=0 here, the next tick() will see 0.
+                # But modify: tick check is "if remaining > 0: ... if remaining == 0"
+                # If we set to 0 here, next tick sees 0. It won't decrement. 
+                # It won't enter "remaining > 0" block.
+                # It won't trigger start_alert().
+                # Fix: If we set to 0, call start_alert?
+                if new_time == 0:
+                    t.start_alert()
 
     def on_settings_change(self):
         self.process_inputs_and_populate_preview()
@@ -492,7 +554,24 @@ class MainWindow(QMainWindow):
                 total_s = self.parse_time_str(self.input_duration.text())
                 if total_s > 0:
                     import math
-                    count = math.floor(total_s / interval_s)
+                    # If offset is present, calculation is tricky.
+                    # Total Duration implies last timer ends at Total Duration.
+                    # If offset present: T_last = offset + (count-1)*interval.
+                    # T_last <= total_s.
+                    # offset + (count-1)*interval <= total_s
+                    # (count-1)*interval <= total_s - offset
+                    # count-1 <= (total_s - offset) / interval
+                    # count <= ((total_s - offset) / interval) + 1
+                    
+                    offset_s = self.parse_time_str(self.input_offset.text())
+                    
+                    if offset_s > 0:
+                         if total_s < offset_s:
+                             count = 0
+                         else:
+                             count = math.floor(((total_s - offset_s) / interval_s)) + 1
+                    else:
+                        count = math.floor(total_s / interval_s)
 
             if count <= 0: return
             
@@ -502,8 +581,16 @@ class MainWindow(QMainWindow):
 
             # 3. Create Widgets
             mode = "bar" if self.chk_progressbar.isChecked() else "text"
+            
+            offset_s = self.parse_time_str(self.input_offset.text())
+            start_base = offset_s if offset_s > 0 else interval_s
+            
             for i in range(count):
-                duration = (i + 1) * interval_s
+                # i=0 -> start_base
+                # i=1 -> start_base + interval
+                # ...
+                duration = start_base + (i * interval_s)
+                
                 t_widget = TimerWidget(duration, display_mode=mode, parent=self)
                 t_widget.parent_window = self
                 self.timers.append(t_widget)
@@ -540,6 +627,7 @@ class MainWindow(QMainWindow):
             # Clearing inputs triggers signals which calls rebuild_timers -> clear list
             self.input_count.clear()
             self.input_duration.clear()
+            self.input_offset.clear() # Clear offset too
             # Ensure they are re-enabled
             self.input_count.setDisabled(False)
             self.input_duration.setDisabled(False)
@@ -556,29 +644,15 @@ class MainWindow(QMainWindow):
         any_alerting = False
         alerting_timer = None
         
-        # We need to sort timers to find "next" or priority?
-        # Spec: "only one timer at a time is sounding"
-        # "next timer in sequence begins sounding"
-        
-        # Logic: 
-        # Iterate all timers. 
-        # If one hits 0 this tick -> Start Alert. (If another was alerting, stop it?)
-        
-        # Because we "tick" them all, we can check states.
-        
         for t in self.timers:
             t.tick() 
             if t.is_alerting:
                 any_alerting = True
                 alerting_timer = t
 
-        # Play sound if needed
-        # Note: TimerWidget logic calls start_alert().
-        # We need to ensure mutual exclusivity for sound.
-        
-        if any_alerting:
-             self.play_sound()
-        else:
+        # Sound logic handled via signals now for restarts
+        # But we still need to ensure if NO ONE is alerting, sound stops.
+        if not any_alerting:
              self.stop_sound()
 
 def main():
