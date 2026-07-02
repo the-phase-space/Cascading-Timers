@@ -126,6 +126,21 @@ impl AudioPlayer {
         self.sound_path = Some(path);
     }
 
+    /// Tear down and recreate the output stream against the current default
+    /// output device. rodio binds to the default device once at creation and
+    /// does not follow device changes, so when the active device is swapped or
+    /// unplugged (Windows falls back to another) the old stream goes silent for
+    /// good — a fresh stream is the only recovery. Preserves the selected sound
+    /// and drops any in-progress playback. If no default device can be opened,
+    /// the existing stream is left in place so a later retry can succeed.
+    fn reinit(&mut self) {
+        self.stop();
+        if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
+            self._stream = stream;
+            self.stream_handle = handle;
+        }
+    }
+
     fn play_once(&mut self) {
         self.stop();
         if let Some(path) = &self.sound_path {
@@ -1136,6 +1151,28 @@ impl CascadingTimersApp {
         self.current_alert_path = None;
     }
 
+    /// Rebind audio output to the current default device without disturbing any
+    /// timer state. Fixes the case where the audio device is changed/unplugged
+    /// mid-session and rodio's launch-time stream goes permanently silent.
+    fn reload_audio(&mut self) {
+        if let Some(ref mut audio) = self.audio {
+            audio.reinit();
+        } else {
+            // Audio was unavailable at launch (no output device then). Bring it
+            // up now and re-apply the configured alert sound.
+            let mut audio = AudioPlayer::new();
+            if let Some(ref mut a) = audio {
+                if !self.config.sound_file.is_empty() {
+                    let path = PathBuf::from(&self.config.sound_file);
+                    if path.exists() {
+                        a.set_sound(path);
+                    }
+                }
+            }
+            self.audio = audio;
+        }
+    }
+
     fn process_tick(&mut self) {
         // Handle preview fade-out
         if let Some(ref mut audio) = self.audio {
@@ -1890,6 +1927,14 @@ impl eframe::App for CascadingTimersApp {
                                 }
                             }
                         });
+
+                        let reload_resp = secondary_button(ui, "Reload Audio");
+                        if reload_resp.clicked() {
+                            self.reload_audio();
+                        }
+                        reload_resp.on_hover_text(
+                            "Reconnect audio output — use after unplugging or switching your audio device",
+                        );
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.repeat_alert_enabled {
