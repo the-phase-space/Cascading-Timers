@@ -1,10 +1,10 @@
 import sys
 import os
 import configparser
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QLineEdit, QPushButton,
                              QScrollArea, QFrame, QMessageBox, QFileDialog, QCheckBox,
-                             QProgressBar)
+                             QProgressBar, QSlider)
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
@@ -124,15 +124,17 @@ class TimerWidget(QFrame):
         else:
             self.update_style()
 
-    def tick(self):
+    def tick(self, speed_multiplier=1.0):
         if self.is_active:
             if self.remaining_seconds > 0:
-                self.remaining_seconds -= 1
+                self.remaining_seconds -= speed_multiplier
+                if self.remaining_seconds < 0:
+                    self.remaining_seconds = 0
                 self.update_display()
-                if self.remaining_seconds == 0:
+                if self.remaining_seconds <= 0:
                     self.start_alert()
         elif self.is_alerting:
-            self.alert_duration_remaining -= 1
+            self.alert_duration_remaining -= 1  # Alert duration not affected by speed
             if self.alert_duration_remaining <= 0:
                 self.silence()
 
@@ -282,6 +284,40 @@ class MainWindow(QMainWindow):
         self.input_offset.textChanged.connect(self.on_offset_changed)
         h_offset.addWidget(self.input_offset)
         settings_layout.addLayout(h_offset)
+
+        # Speed Multiplier
+        h_speed = QHBoxLayout()
+        h_speed.addWidget(QLabel("Speed:"))
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setMinimum(50)  # 0.50x
+        self.speed_slider.setMaximum(200)  # 2.00x
+        self.speed_slider.setValue(100)  # 1.00x default
+        self.speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.speed_slider.setTickInterval(50)
+        self.speed_slider.valueChanged.connect(self.on_speed_changed)
+        self.speed_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 1px solid #fc035e;
+                height: 8px;
+                background: #0d112b;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #fc035e;
+                border: 1px solid #fc035e;
+                width: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #ff337e;
+            }
+        """)
+        h_speed.addWidget(self.speed_slider)
+        self.lbl_speed = QLabel("1.00x")
+        self.lbl_speed.setFixedWidth(45)
+        h_speed.addWidget(self.lbl_speed)
+        settings_layout.addLayout(h_speed)
 
         main_layout.addWidget(settings_frame)
 
@@ -683,11 +719,20 @@ class MainWindow(QMainWindow):
             self.enable_field(self.input_count)
             self.enable_field(self.input_duration)
 
+    def on_speed_changed(self):
+        """Update speed label when slider changes"""
+        speed = self.speed_slider.value() / 100.0
+        self.lbl_speed.setText(f"{speed:.2f}x")
+
+    def get_speed_multiplier(self):
+        """Get current speed multiplier value"""
+        return self.speed_slider.value() / 100.0
+
     def on_display_mode_changed(self):
         mode = "bar" if self.chk_progressbar.isChecked() else "text"
         self.config['Settings']['progress_bar_mode'] = str(self.chk_progressbar.isChecked())
         self.save_config()
-        
+
         # Update existing
         for t in self.timers:
             t.set_display_mode(mode)
@@ -810,9 +855,11 @@ class MainWindow(QMainWindow):
         # Check alerts logic
         any_alerting = False
         alerting_timer = None
-        
+
+        speed = self.get_speed_multiplier()
+
         for t in self.timers:
-            t.tick() 
+            t.tick(speed)
             if t.is_alerting:
                 any_alerting = True
                 alerting_timer = t
@@ -820,7 +867,7 @@ class MainWindow(QMainWindow):
         # Sound logic handled via signals now for restarts
         # But we still need to ensure if NO ONE is alerting, sound stops.
         if not any_alerting:
-             self.stop_sound()
+            self.stop_sound()
 
 def main():
     app = QApplication(sys.argv)
