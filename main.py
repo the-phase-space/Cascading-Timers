@@ -187,9 +187,10 @@ class MainWindow(QMainWindow):
     def load_config(self):
         if not os.path.exists(CONFIG_FILE):
             self.config['Settings'] = {
-                'interval': '600',
-                'timer_count': '3',
-                'sound_file': ''
+                'interval': '',
+                'timer_count': '',
+                'sound_file': '',
+                'progress_bar_mode': 'False'
             }
             self.save_config()
         else:
@@ -250,22 +251,21 @@ class MainWindow(QMainWindow):
         h_interval.addWidget(QLabel("Interval:"))
         self.input_interval = QLineEdit()
         self.input_interval.setPlaceholderText("HH:MM:SS")
-        self.input_interval.setText(self.get_friendly_time(int(self.config['Settings'].get('interval', '600'))))
-        self.input_interval.textChanged.connect(self.on_settings_change)
+        # Don't pre-fill - let user enter values
+        self.input_interval.textChanged.connect(self.on_interval_changed)
         h_interval.addWidget(self.input_interval)
         settings_layout.addLayout(h_interval)
 
-        # Count vs Duration (Mutually Exclusive)
-        # Row 1: Count
+        # Count
         h_count = QHBoxLayout()
         h_count.addWidget(QLabel("Timer Count:"))
         self.input_count = QLineEdit()
-        self.input_count.setText(self.config['Settings'].get('timer_count', '3'))
+        # Don't pre-fill - let user enter values
         self.input_count.textChanged.connect(self.on_count_changed)
         h_count.addWidget(self.input_count)
         settings_layout.addLayout(h_count)
-        
-        # Row 2: Total Duration
+
+        # Total Duration
         h_total = QHBoxLayout()
         h_total.addWidget(QLabel("Total Duration:"))
         self.input_duration = QLineEdit()
@@ -279,7 +279,7 @@ class MainWindow(QMainWindow):
         h_offset.addWidget(QLabel("Offset (First Timer):"))
         self.input_offset = QLineEdit()
         self.input_offset.setPlaceholderText("HH:MM:SS")
-        self.input_offset.textChanged.connect(self.on_settings_change)
+        self.input_offset.textChanged.connect(self.on_offset_changed)
         h_offset.addWidget(self.input_offset)
         settings_layout.addLayout(h_offset)
 
@@ -363,8 +363,7 @@ class MainWindow(QMainWindow):
         sound_layout.addLayout(sound_controls)
         main_layout.addLayout(sound_layout)
 
-        # Initial populate
-        self.process_inputs_and_populate_preview()
+        # Don't populate on init - wait for user to fill fields
 
     def setup_sound(self):
         # Use QMediaPlayer for better compatibility (MP3 etc)
@@ -493,25 +492,196 @@ class MainWindow(QMainWindow):
                     t.start_alert()
 
     def on_settings_change(self):
-        self.process_inputs_and_populate_preview()
+        self.update_field_states()
+
+    def on_interval_changed(self):
+        self.update_field_states()
 
     def on_count_changed(self):
-        if self.input_count.text().strip():
-            self.input_duration.setDisabled(True)
-            self.input_duration.setStyleSheet("background-color: #333; color: #555; border: 1px solid #555;")
-        else:
-            self.input_duration.setDisabled(False)
-            self.input_duration.setStyleSheet("background-color: #0d112b; color: white; border: 1px solid #fc035e;")
-        self.process_inputs_and_populate_preview()
+        self.update_field_states()
 
     def on_duration_changed(self):
-        if self.input_duration.text().strip():
-            self.input_count.setDisabled(True)
-            self.input_count.setStyleSheet("background-color: #333; color: #555; border: 1px solid #555;")
+        self.update_field_states()
+
+    def on_offset_changed(self):
+        """When offset changes, recalculate the disabled field"""
+        # Determine which field is currently disabled and recalculate it
+        if not self.input_interval.isEnabled():
+            self.calculate_interval()
+        elif not self.input_count.isEnabled():
+            self.calculate_count()
+        elif not self.input_duration.isEnabled():
+            self.calculate_duration()
+
+        # Rebuild timers if we have enough data
+        interval_filled = bool(self.input_interval.text().strip())
+        count_filled = bool(self.input_count.text().strip())
+        duration_filled = bool(self.input_duration.text().strip())
+        filled_count = sum([interval_filled, count_filled, duration_filled])
+
+        if filled_count >= 2:
+            self.process_inputs_and_populate_preview()
+
+    def enable_field(self, field):
+        field.setDisabled(False)
+        field.setStyleSheet("background-color: #0d112b; color: white; border: 1px solid #fc035e; padding: 5px; border-radius: 3px;")
+
+    def disable_field(self, field):
+        field.setDisabled(True)
+        field.setStyleSheet("background-color: #333; color: #555; border: 1px solid #555; padding: 5px; border-radius: 3px;")
+
+    def calculate_interval(self):
+        """Calculate interval from count and duration"""
+        try:
+            count_text = self.input_count.text().strip()
+            duration_text = self.input_duration.text().strip()
+
+            if not count_text or not duration_text:
+                return
+
+            count = int(count_text)
+            total_duration = self.parse_time_str(duration_text)
+
+            if count <= 1 or total_duration <= 0:
+                return
+
+            offset_s = self.parse_time_str(self.input_offset.text().strip())
+
+            # total_duration = offset + (count - 1) * interval
+            # interval = (total_duration - offset) / (count - 1)
+            if offset_s > 0:
+                interval = (total_duration - offset_s) / (count - 1)
+            else:
+                interval = total_duration / count
+
+            if interval > 0:
+                self.input_interval.blockSignals(True)
+                self.input_interval.setText(self.get_friendly_time(int(interval)))
+                self.input_interval.blockSignals(False)
+        except (ValueError, ZeroDivisionError, AttributeError):
+            pass
+
+    def calculate_count(self):
+        """Calculate count from interval and duration"""
+        try:
+            interval_text = self.input_interval.text().strip()
+            duration_text = self.input_duration.text().strip()
+
+            if not interval_text or not duration_text:
+                return
+
+            interval = self.parse_time_str(interval_text)
+            total_duration = self.parse_time_str(duration_text)
+
+            if interval <= 0 or total_duration <= 0:
+                return
+
+            offset_s = self.parse_time_str(self.input_offset.text().strip())
+
+            # total_duration = offset + (count - 1) * interval
+            # count = ((total_duration - offset) / interval) + 1
+            import math
+            if offset_s > 0:
+                if total_duration < offset_s:
+                    count = 0
+                else:
+                    count = math.floor((total_duration - offset_s) / interval) + 1
+            else:
+                count = math.floor(total_duration / interval)
+
+            if count > 0:
+                self.input_count.blockSignals(True)
+                self.input_count.setText(str(count))
+                self.input_count.blockSignals(False)
+        except (ValueError, ZeroDivisionError, AttributeError):
+            pass
+
+    def calculate_duration(self):
+        """Calculate duration from interval and count"""
+        try:
+            interval_text = self.input_interval.text().strip()
+            count_text = self.input_count.text().strip()
+
+            if not interval_text or not count_text:
+                return
+
+            interval = self.parse_time_str(interval_text)
+            count = int(count_text)
+
+            if interval <= 0 or count <= 0:
+                return
+
+            offset_s = self.parse_time_str(self.input_offset.text().strip())
+
+            # total_duration = offset + (count - 1) * interval
+            if offset_s > 0:
+                total_duration = offset_s + (count - 1) * interval
+            else:
+                total_duration = count * interval
+
+            self.input_duration.blockSignals(True)
+            self.input_duration.setText(self.get_friendly_time(int(total_duration)))
+            self.input_duration.blockSignals(False)
+        except (ValueError, AttributeError):
+            pass
+
+    def is_valid_filled(self, field, is_count_field=False):
+        """Check if a field has a valid value (not just any text)"""
+        text = field.text().strip()
+        if not text:
+            return False
+
+        # Ignore placeholder-like text
+        if text.upper() in ["HH:MM:SS", "H:M:S"]:
+            return False
+
+        try:
+            if is_count_field:
+                return int(text) > 0
+            else:
+                return self.parse_time_str(text) > 0
+        except (ValueError, AttributeError):
+            return False
+
+    def update_field_states(self):
+        """Update which fields are enabled/disabled based on which are filled"""
+        interval_filled = self.is_valid_filled(self.input_interval)
+        count_filled = self.is_valid_filled(self.input_count, is_count_field=True)
+        duration_filled = self.is_valid_filled(self.input_duration)
+
+        filled_count = sum([interval_filled, count_filled, duration_filled])
+
+        if filled_count >= 2:
+            # Determine which field to disable and calculate
+            if not interval_filled:
+                self.disable_field(self.input_interval)
+                self.calculate_interval()
+                self.enable_field(self.input_count)
+                self.enable_field(self.input_duration)
+            elif not count_filled:
+                self.disable_field(self.input_count)
+                self.calculate_count()
+                self.enable_field(self.input_interval)
+                self.enable_field(self.input_duration)
+            elif not duration_filled:
+                self.disable_field(self.input_duration)
+                self.calculate_duration()
+                self.enable_field(self.input_interval)
+                self.enable_field(self.input_count)
+            else:
+                # All three filled - prefer interval + count, recalculate duration
+                self.disable_field(self.input_duration)
+                self.calculate_duration()
+                self.enable_field(self.input_interval)
+                self.enable_field(self.input_count)
+
+            # Rebuild timers with the calculated values
+            self.process_inputs_and_populate_preview()
         else:
-            self.input_count.setDisabled(False)
-            self.input_count.setStyleSheet("background-color: #0d112b; color: white; border: 1px solid #fc035e;")
-        self.process_inputs_and_populate_preview()
+            # Less than 2 filled - enable all, don't rebuild
+            self.enable_field(self.input_interval)
+            self.enable_field(self.input_count)
+            self.enable_field(self.input_duration)
 
     def on_display_mode_changed(self):
         mode = "bar" if self.chk_progressbar.isChecked() else "text"
@@ -527,12 +697,6 @@ class MainWindow(QMainWindow):
             pass
         else:
             self.rebuild_timers()
-        
-        try:
-            if self.input_count.isEnabled():
-                self.config['Settings']['timer_count'] = self.input_count.text()
-        except:
-            pass
 
     def rebuild_timers(self):
         # 1. Clear existing
@@ -596,9 +760,12 @@ class MainWindow(QMainWindow):
                 self.timers.append(t_widget)
                 self.timers_layout.addWidget(t_widget)
 
-            # Save valid interval to config
-            self.config['Settings']['interval'] = str(interval_s)
-            self.save_config()
+            # Save valid interval to config (only if actually valid)
+            if interval_s > 0:
+                self.config['Settings']['interval'] = str(interval_s)
+                if count > 0:
+                    self.config['Settings']['timer_count'] = str(count)
+                self.save_config()
 
         except ValueError:
             pass
