@@ -1,0 +1,1288 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use eframe::egui;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+// ─── Colors (matching Python theme) ───────────────────────────────────────────
+const BG_DARK: egui::Color32 = egui::Color32::from_rgb(0x01, 0x04, 0x21);
+const BG_WIDGET: egui::Color32 = egui::Color32::from_rgb(0x0D, 0x11, 0x2B);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xFC, 0x03, 0x5E);
+const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x33, 0x7E);
+const TEXT_WHITE: egui::Color32 = egui::Color32::WHITE;
+const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(0xAA, 0xAA, 0xAA);
+const DISABLED_BORDER: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
+const CLEAR_RED: egui::Color32 = egui::Color32::from_rgb(0xAB, 0x00, 0x00);
+const BTN_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
+
+// ─── Config persistence ──────────────────────────────────────────────────────
+fn config_path() -> PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    exe_dir.join("config.ini")
+}
+
+#[derive(Clone)]
+struct Config {
+    interval: String,
+    timer_count: String,
+    sound_file: String,
+    progress_bar_mode: bool,
+}
+
+impl Config {
+    fn load() -> Self {
+        let path = config_path();
+        if path.exists() {
+            let mut conf = configparser::ini::Ini::new();
+            if conf.load(path.to_string_lossy().as_ref()).is_ok() {
+                return Self {
+                    interval: conf.get("Settings", "interval").unwrap_or_default(),
+                    timer_count: conf.get("Settings", "timer_count").unwrap_or_default(),
+                    sound_file: conf.get("Settings", "sound_file").unwrap_or_default(),
+                    progress_bar_mode: conf
+                        .get("Settings", "progress_bar_mode")
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case("true"),
+                };
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self) {
+        let mut conf = configparser::ini::Ini::new();
+        conf.set("Settings", "interval", Some(self.interval.clone()));
+        conf.set("Settings", "timer_count", Some(self.timer_count.clone()));
+        conf.set("Settings", "sound_file", Some(self.sound_file.clone()));
+        conf.set(
+            "Settings",
+            "progress_bar_mode",
+            Some(if self.progress_bar_mode { "True" } else { "False" }.to_string()),
+        );
+        let _ = conf.write(config_path().to_string_lossy().as_ref());
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            interval: String::new(),
+            timer_count: String::new(),
+            sound_file: String::new(),
+            progress_bar_mode: false,
+        }
+    }
+}
+
+// ─── Audio ───────────────────────────────────────────────────────────────────
+struct AudioPlayer {
+    _stream: rodio::OutputStream,
+    stream_handle: rodio::OutputStreamHandle,
+    sink: Option<rodio::Sink>,
+    sound_path: Option<PathBuf>,
+    preview_start: Option<Instant>,
+}
+
+const PREVIEW_TOTAL_MS: u64 = 4000;
+const PREVIEW_FADE_MS: u64 = 400;
+
+impl AudioPlayer {
+    fn new() -> Option<Self> {
+        let (stream, handle) = rodio::OutputStream::try_default().ok()?;
+        Some(Self {
+            _stream: stream,
+            stream_handle: handle,
+            sink: None,
+            sound_path: None,
+            preview_start: None,
+        })
+    }
+
+    fn set_sound(&mut self, path: PathBuf) {
+        self.sound_path = Some(path);
+    }
+
+    fn play_looping(&mut self) {
+        self.stop();
+        if let Some(path) = &self.sound_path {
+            if let Ok(file) = std::fs::File::open(path) {
+                let reader = std::io::BufReader::new(file);
+                if let Ok(source) = rodio::Decoder::new(reader) {
+                    let sink = rodio::Sink::try_new(&self.stream_handle).ok();
+                    if let Some(ref s) = sink {
+                        use rodio::Source;
+                        s.append(source.repeat_infinite());
+                        s.play();
+                    }
+                    self.sink = sink;
+                }
+            }
+        }
+    }
+
+    fn preview(&mut self) {
+        // No-op if already playing a preview
+        if self.preview_start.is_some() && self.is_playing() {
+            return;
+        }
+        self.stop();
+        let path = match &self.sound_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let reader = std::io::BufReader::new(file);
+        let source = match rodio::Decoder::new(reader) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if let Ok(sink) = rodio::Sink::try_new(&self.stream_handle) {
+            sink.set_volume(0.0);
+            sink.append(source);
+            sink.play();
+            self.sink = Some(sink);
+            self.preview_start = Some(Instant::now());
+        }
+    }
+
+    /// Call each frame to drive preview fade-in, fade-out, and stop.
+    fn tick_preview(&mut self) {
+        if let Some(start) = self.preview_start {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let fade_out_begin = PREVIEW_TOTAL_MS - PREVIEW_FADE_MS;
+
+            if elapsed_ms >= PREVIEW_TOTAL_MS {
+                self.stop();
+            } else if let Some(ref sink) = self.sink {
+                let volume = if elapsed_ms < PREVIEW_FADE_MS {
+                    // Fade-in
+                    elapsed_ms as f32 / PREVIEW_FADE_MS as f32
+                } else if elapsed_ms >= fade_out_begin {
+                    // Fade-out
+                    let progress =
+                        (elapsed_ms - fade_out_begin) as f32 / PREVIEW_FADE_MS as f32;
+                    1.0 - progress
+                } else {
+                    1.0
+                };
+                sink.set_volume(volume.clamp(0.0, 1.0));
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(sink) = self.sink.take() {
+            sink.stop();
+        }
+        self.preview_start = None;
+    }
+
+    fn is_playing(&self) -> bool {
+        self.sink.as_ref().is_some_and(|s| !s.empty())
+    }
+}
+
+// ─── Timer ───────────────────────────────────────────────────────────────────
+struct Timer {
+    id: u64,
+    total_seconds: f64,
+    remaining_seconds: f64,
+    is_active: bool,
+    is_alerting: bool,
+    alert_duration_remaining: f64,
+    marked_for_removal: bool,
+}
+
+impl Timer {
+    fn new(id: u64, duration_seconds: f64) -> Self {
+        Self {
+            id,
+            total_seconds: duration_seconds,
+            remaining_seconds: duration_seconds,
+            is_active: false,
+            is_alerting: false,
+            alert_duration_remaining: 60.0,
+            marked_for_removal: false,
+        }
+    }
+
+    /// Advance this timer by dt_seconds * speed. Returns true if alert just started.
+    fn tick(&mut self, dt_seconds: f64, speed_multiplier: f64) -> bool {
+        if self.is_active {
+            if self.remaining_seconds > 0.0 {
+                self.remaining_seconds -= dt_seconds * speed_multiplier;
+                if self.remaining_seconds < 0.0 {
+                    self.remaining_seconds = 0.0;
+                }
+                if self.remaining_seconds <= 0.0 {
+                    self.is_active = false;
+                    self.is_alerting = true;
+                    return true;
+                }
+            }
+        } else if self.is_alerting {
+            self.alert_duration_remaining -= dt_seconds; // Alert not affected by speed
+            if self.alert_duration_remaining <= 0.0 {
+                self.silence();
+            }
+        }
+        false
+    }
+
+    fn silence(&mut self) {
+        self.is_alerting = false;
+        self.marked_for_removal = true;
+    }
+
+    fn format_time(&self) -> String {
+        let secs = self.remaining_seconds.max(0.0) as u64;
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        if h > 0 {
+            format!("{h:02}:{m:02}:{s:02}")
+        } else {
+            format!("{m:02}:{s:02}")
+        }
+    }
+
+    fn fraction_remaining(&self) -> f32 {
+        if self.total_seconds > 0.0 {
+            (self.remaining_seconds / self.total_seconds) as f32
+        } else {
+            0.0
+        }
+    }
+}
+
+// ─── Time parsing ────────────────────────────────────────────────────────────
+fn parse_time_str(s: &str) -> f64 {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        return 0.0;
+    }
+
+    // HH:MM:SS or MM:SS format
+    if s.contains(':') {
+        let parts: Vec<&str> = s.split(':').collect();
+        let mut total = 0.0;
+        for (i, part) in parts.iter().rev().enumerate() {
+            if let Ok(v) = part.trim().parse::<f64>() {
+                match i {
+                    0 => total += v,          // seconds
+                    1 => total += v * 60.0,   // minutes
+                    2 => total += v * 3600.0, // hours
+                    _ => {}
+                }
+            }
+        }
+        return total;
+    }
+
+    // Natural language: "1h 30m 45s" or raw number (=minutes)
+    let mut total = 0.0;
+    for part in s.split_whitespace() {
+        if let Some(num_str) = part.strip_suffix('h') {
+            if let Ok(v) = num_str.parse::<f64>() {
+                total += v * 3600.0;
+            }
+        } else if let Some(num_str) = part.strip_suffix('m') {
+            if let Ok(v) = num_str.parse::<f64>() {
+                total += v * 60.0;
+            }
+        } else if let Some(num_str) = part.strip_suffix('s') {
+            if let Ok(v) = num_str.parse::<f64>() {
+                total += v;
+            }
+        } else if let Ok(v) = part.parse::<f64>() {
+            total += v * 60.0; // Raw numbers default to minutes
+        }
+    }
+    total
+}
+
+// ─── Field state tracking ────────────────────────────────────────────────────
+#[derive(PartialEq, Clone, Copy)]
+enum DisabledField {
+    None,
+    Interval,
+    Count,
+    Duration,
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+struct CascadingTimersApp {
+    // Settings inputs
+    input_interval: String,
+    input_count: String,
+    input_duration: String,
+    input_offset: String,
+
+    // Calculated values for disabled fields
+    calculated_interval: f64,
+    calculated_count: u32,
+    calculated_duration: f64,
+
+    disabled_field: DisabledField,
+
+    // Speed
+    speed_pct: u32, // 50..=200, representing 0.50x to 2.00x
+
+    // Display mode
+    progress_bar_mode: bool,
+
+    // Timers
+    timers: Vec<Timer>,
+    next_timer_id: u64,
+    is_paused: bool,
+
+    // Time tracking
+    last_tick: Instant,
+
+    // Audio
+    audio: Option<AudioPlayer>,
+    sound_file_display: String,
+    audio_timeout_start: Option<Instant>,
+
+    // Config
+    config: Config,
+
+    // UI state
+    pending_clear: bool,
+    needs_rebuild: bool,
+    timers_running: bool,
+}
+
+const FONT_BOLD: &str = "app-bold";
+const FONT_TIMER: &str = "app-timer";
+
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Aptos Regular — primary UI font
+    let aptos_regular = find_aptos_font("30153066857.ttf")
+        .or_else(|| load_system_font("segoeui.ttf"));
+    if let Some(data) = aptos_regular {
+        fonts
+            .font_data
+            .insert("aptos-regular".to_string(), egui::FontData::from_owned(data).into());
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .insert(0, "aptos-regular".to_string());
+    }
+
+    // Aptos Bold — for buttons
+    let aptos_bold = find_aptos_font("32483553004.ttf")
+        .or_else(|| load_system_font("segoeuib.ttf"));
+    if let Some(data) = aptos_bold {
+        fonts
+            .font_data
+            .insert("aptos-bold".to_string(), egui::FontData::from_owned(data).into());
+        fonts.families.insert(
+            egui::FontFamily::Name(FONT_BOLD.into()),
+            vec!["aptos-bold".to_string()],
+        );
+    }
+
+    // Segoe UI — for timer countdown text
+    if let Some(data) = load_system_font("segoeui.ttf") {
+        fonts
+            .font_data
+            .insert("segoe-ui".to_string(), egui::FontData::from_owned(data).into());
+        fonts.families.insert(
+            egui::FontFamily::Name(FONT_TIMER.into()),
+            vec!["segoe-ui".to_string()],
+        );
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+fn find_aptos_font(filename: &str) -> Option<Vec<u8>> {
+    let home = std::env::var("LOCALAPPDATA").ok()?;
+    let path = PathBuf::from(home)
+        .join(r"Microsoft\FontCache\4\CloudFonts\Aptos")
+        .join(filename);
+    std::fs::read(&path).ok()
+}
+
+fn load_system_font(filename: &str) -> Option<Vec<u8>> {
+    let path = PathBuf::from(r"C:\Windows\Fonts").join(filename);
+    std::fs::read(&path).ok()
+}
+
+impl CascadingTimersApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        setup_fonts(&cc.egui_ctx);
+        let config = Config::load();
+
+        let mut audio = AudioPlayer::new();
+        let mut sound_display = "No sound selected".to_string();
+        if !config.sound_file.is_empty() {
+            let path = PathBuf::from(&config.sound_file);
+            if path.exists() {
+                sound_display = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                if let Some(ref mut a) = audio {
+                    a.set_sound(path);
+                }
+            }
+        }
+
+        Self {
+            input_interval: String::new(),
+            input_count: String::new(),
+            input_duration: String::new(),
+            input_offset: String::new(),
+
+            calculated_interval: 0.0,
+            calculated_count: 0,
+            calculated_duration: 0.0,
+
+            disabled_field: DisabledField::None,
+
+            speed_pct: 100,
+
+            progress_bar_mode: config.progress_bar_mode,
+
+            timers: Vec::new(),
+            next_timer_id: 1,
+            is_paused: true,
+
+            last_tick: Instant::now(),
+
+            audio,
+            sound_file_display: sound_display,
+            audio_timeout_start: None,
+
+            config,
+
+            pending_clear: false,
+            needs_rebuild: false,
+            timers_running: false,
+        }
+    }
+
+    fn speed_multiplier(&self) -> f64 {
+        self.speed_pct as f64 / 100.0
+    }
+
+    fn is_valid_time(s: &str) -> bool {
+        let s = s.trim();
+        !s.is_empty() && parse_time_str(s) > 0.0
+    }
+
+    fn is_valid_count(s: &str) -> bool {
+        let s = s.trim();
+        if s.is_empty() {
+            return false;
+        }
+        s.parse::<u32>().is_ok_and(|v| v > 0)
+    }
+
+    fn update_field_states(&mut self) {
+        let interval_filled =
+            self.disabled_field != DisabledField::Interval && Self::is_valid_time(&self.input_interval);
+        let count_filled =
+            self.disabled_field != DisabledField::Count && Self::is_valid_count(&self.input_count);
+        let duration_filled =
+            self.disabled_field != DisabledField::Duration && Self::is_valid_time(&self.input_duration);
+
+        let filled = interval_filled as u8 + count_filled as u8 + duration_filled as u8;
+
+        if filled >= 2 {
+            if !interval_filled {
+                self.disabled_field = DisabledField::Interval;
+                self.calculate_interval();
+            } else if !count_filled {
+                self.disabled_field = DisabledField::Count;
+                self.calculate_count();
+            } else if !duration_filled {
+                self.disabled_field = DisabledField::Duration;
+                self.calculate_duration();
+            } else {
+                // All three filled — prefer interval+count, recalculate duration
+                self.disabled_field = DisabledField::Duration;
+                self.calculate_duration();
+            }
+            self.needs_rebuild = true;
+        } else {
+            self.disabled_field = DisabledField::None;
+        }
+    }
+
+    fn calculate_interval(&mut self) {
+        let count: f64 = self.input_count.trim().parse().unwrap_or(0.0);
+        let total_duration = parse_time_str(&self.input_duration);
+        if count <= 1.0 || total_duration <= 0.0 {
+            return;
+        }
+        let offset = parse_time_str(&self.input_offset);
+        let interval = if offset > 0.0 {
+            (total_duration - offset) / (count - 1.0)
+        } else {
+            total_duration / count
+        };
+        if interval > 0.0 {
+            self.calculated_interval = interval.floor();
+        }
+    }
+
+    fn calculate_count(&mut self) {
+        let interval = parse_time_str(&self.input_interval);
+        let total_duration = parse_time_str(&self.input_duration);
+        if interval <= 0.0 || total_duration <= 0.0 {
+            return;
+        }
+        let offset = parse_time_str(&self.input_offset);
+        let count = if offset > 0.0 {
+            if total_duration < offset {
+                0.0
+            } else {
+                ((total_duration - offset) / interval).floor() + 1.0
+            }
+        } else {
+            (total_duration / interval).floor()
+        };
+        if count > 0.0 {
+            self.calculated_count = (count as u32).min(20);
+        }
+    }
+
+    fn calculate_duration(&mut self) {
+        let interval = parse_time_str(&self.input_interval);
+        let count: f64 = self.input_count.trim().parse().unwrap_or(0.0);
+        if interval <= 0.0 || count <= 0.0 {
+            return;
+        }
+        let offset = parse_time_str(&self.input_offset);
+        let total = if offset > 0.0 {
+            offset + (count - 1.0) * interval
+        } else {
+            count * interval
+        };
+        self.calculated_duration = total;
+    }
+
+    fn get_effective_interval(&self) -> f64 {
+        if self.disabled_field == DisabledField::Interval {
+            self.calculated_interval
+        } else {
+            parse_time_str(&self.input_interval)
+        }
+    }
+
+    fn get_effective_count(&self) -> u32 {
+        if self.disabled_field == DisabledField::Count {
+            self.calculated_count
+        } else {
+            self.input_count.trim().parse().unwrap_or(0)
+        }
+    }
+
+    fn rebuild_timers(&mut self) {
+        if self.timers_running {
+            return;
+        }
+
+        self.timers.clear();
+
+        let interval_s = self.get_effective_interval();
+        if interval_s <= 0.0 {
+            return;
+        }
+
+        let count = self.get_effective_count().min(20);
+        if count == 0 {
+            return;
+        }
+
+        let offset_s = parse_time_str(&self.input_offset);
+        let start_base = if offset_s > 0.0 { offset_s } else { interval_s };
+
+        for i in 0..count {
+            let duration = start_base + (i as f64) * interval_s;
+            let id = self.next_timer_id;
+            self.next_timer_id += 1;
+            self.timers.push(Timer::new(id, duration));
+        }
+
+        // Save to config
+        if interval_s > 0.0 {
+            self.config.interval = format!("{}", interval_s as u64);
+            if count > 0 {
+                self.config.timer_count = format!("{count}");
+            }
+            self.config.save();
+        }
+    }
+
+    fn start_all(&mut self) {
+        if self.timers.is_empty() {
+            self.rebuild_timers();
+        }
+        for t in &mut self.timers {
+            if !t.is_alerting && t.remaining_seconds > 0.0 {
+                t.is_active = true;
+            }
+        }
+        self.is_paused = false;
+        self.timers_running = true;
+    }
+
+    fn pause_all(&mut self) {
+        self.is_paused = true;
+        for t in &mut self.timers {
+            t.is_active = false;
+        }
+        self.stop_sound();
+    }
+
+    fn clear_all(&mut self) {
+        self.pause_all();
+        self.timers.clear();
+        self.timers_running = false;
+        self.input_count.clear();
+        self.input_duration.clear();
+        self.input_offset.clear();
+        self.disabled_field = DisabledField::None;
+    }
+
+    fn adjust_time(&mut self, delta: f64) {
+        let mut newly_alerting = false;
+        for t in &mut self.timers {
+            if t.remaining_seconds > 0.0 && !t.is_alerting {
+                t.remaining_seconds = (t.remaining_seconds + delta).max(0.0);
+                if t.remaining_seconds <= 0.0 {
+                    t.is_active = false;
+                    t.is_alerting = true;
+                    newly_alerting = true;
+                }
+            }
+        }
+        if newly_alerting {
+            self.stop_sound();
+            self.play_sound();
+        }
+    }
+
+    fn play_sound(&mut self) {
+        if let Some(ref mut audio) = self.audio {
+            if !audio.is_playing() {
+                audio.play_looping();
+                self.audio_timeout_start = Some(Instant::now());
+            }
+        }
+    }
+
+    fn stop_sound(&mut self) {
+        if let Some(ref mut audio) = self.audio {
+            audio.stop();
+        }
+        self.audio_timeout_start = None;
+    }
+
+    fn process_tick(&mut self) {
+        // Handle preview fade-out
+        if let Some(ref mut audio) = self.audio {
+            audio.tick_preview();
+        }
+
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f64();
+        self.last_tick = now;
+
+        let speed = self.speed_multiplier();
+        let mut any_new_alert = false;
+        let mut any_alerting = false;
+
+        for t in &mut self.timers {
+            if t.tick(dt, speed) {
+                any_new_alert = true;
+            }
+            if t.is_alerting {
+                any_alerting = true;
+            }
+        }
+
+        // Remove silenced timers
+        self.timers.retain(|t| !t.marked_for_removal);
+
+        // Sound management (don't interfere with preview)
+        let preview_active = self
+            .audio
+            .as_ref()
+            .is_some_and(|a| a.preview_start.is_some());
+        if any_new_alert {
+            self.stop_sound();
+            self.play_sound();
+        } else if !any_alerting && !preview_active {
+            self.stop_sound();
+        }
+
+        // 4-minute audio timeout
+        if let Some(start) = self.audio_timeout_start {
+            if now.duration_since(start) > Duration::from_secs(240) {
+                self.stop_sound();
+            }
+        }
+    }
+}
+
+// ─── UI helpers ──────────────────────────────────────────────────────────────
+
+fn accent_button_sized(ui: &mut egui::Ui, text: &str, size: egui::Vec2) -> egui::Response {
+    let btn = egui::Button::new(
+        egui::RichText::new(text)
+            .color(TEXT_WHITE)
+            .family(egui::FontFamily::Name(FONT_BOLD.into()))
+            .size(14.0),
+    )
+    .fill(ACCENT)
+    .corner_radius(4.0)
+    .min_size(size);
+    ui.add(btn)
+}
+
+fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let btn = egui::Button::new(egui::RichText::new(text).color(TEXT_WHITE).size(11.0))
+        .fill(BTN_SECONDARY)
+        .corner_radius(4.0);
+    ui.add(btn)
+}
+
+fn styled_text_edit<'a>(text: &'a mut String, hint: &'a str, enabled: bool) -> egui::TextEdit<'a> {
+    egui::TextEdit::singleline(text)
+        .hint_text(if enabled { hint } else { "" })
+        .text_color(if enabled { TEXT_WHITE } else { DISABLED_BORDER })
+        .interactive(enabled)
+}
+
+// ─── eframe impl ─────────────────────────────────────────────────────────────
+
+impl eframe::App for CascadingTimersApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Tick timers
+        self.process_tick();
+
+        // Request continuous repaint while timers are running or preview is playing
+        let preview_active = self
+            .audio
+            .as_ref()
+            .is_some_and(|a| a.preview_start.is_some());
+        if self.timers_running || self.timers.iter().any(|t| t.is_alerting) || preview_active {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+
+        // Process pending rebuild
+        if self.needs_rebuild {
+            self.needs_rebuild = false;
+            let old_count = self.timers.len();
+            self.rebuild_timers();
+            let new_count = self.timers.len();
+            if new_count != old_count {
+                const BASE_HEIGHT: f32 = 340.0;
+                const PER_TIMER: f32 = 46.0;
+                let target = (BASE_HEIGHT + new_count as f32 * PER_TIMER).clamp(400.0, 1200.0);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                    egui::vec2(ctx.screen_rect().width().max(400.0), target),
+                ));
+            }
+        }
+
+        // Apply dark theme styling
+        let mut style = (*ctx.style()).clone();
+        style.visuals.dark_mode = true;
+        style.visuals.panel_fill = BG_DARK;
+        style.visuals.window_fill = BG_DARK;
+        style.visuals.extreme_bg_color = BG_WIDGET;
+        style.visuals.widgets.noninteractive.bg_fill = BG_WIDGET;
+        style.visuals.widgets.inactive.bg_fill = BG_WIDGET;
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+        style.visuals.widgets.hovered.bg_fill = BG_WIDGET;
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT_HOVER);
+        style.visuals.widgets.active.bg_fill = BG_WIDGET;
+        style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+        style.visuals.selection.bg_fill = ACCENT;
+        style.visuals.selection.stroke = egui::Stroke::new(1.0, TEXT_WHITE);
+        ctx.set_style(style);
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BG_DARK).inner_margin(12.0))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+
+                // ── Settings Section ──
+                ui.group(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+
+                    let placeholder = "e.g. 1h 30m, 0:10:00, 90 (=90m)";
+                    let mut fields_changed = false;
+
+                    // Interval
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Interval:").color(TEXT_WHITE).size(14.0),
+                        );
+                        let enabled = self.disabled_field != DisabledField::Interval;
+                        let te = styled_text_edit(&mut self.input_interval, placeholder, enabled);
+                        let r = ui.add_sized([ui.available_width(), 24.0], te);
+                        if r.changed() {
+                            self.input_interval
+                                .retain(|c| c.is_ascii_digit() || "hmsHMS: ".contains(c));
+                            fields_changed = true;
+                        }
+                    });
+
+                    // Count
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Timer Count:").color(TEXT_WHITE).size(14.0),
+                        );
+                        let enabled = self.disabled_field != DisabledField::Count;
+                        let te = styled_text_edit(&mut self.input_count, "", enabled);
+                        let r = ui.add_sized([ui.available_width(), 24.0], te);
+                        if r.changed() {
+                            self.input_count.retain(|c| c.is_ascii_digit());
+                            if let Ok(v) = self.input_count.trim().parse::<u32>() {
+                                if v > 20 {
+                                    self.input_count = "20".to_string();
+                                }
+                            }
+                            fields_changed = true;
+                        }
+                    });
+
+                    // Duration
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Total Duration:")
+                                .color(TEXT_WHITE)
+                                .size(14.0),
+                        );
+                        let enabled = self.disabled_field != DisabledField::Duration;
+                        let te = styled_text_edit(&mut self.input_duration, placeholder, enabled);
+                        let r = ui.add_sized([ui.available_width(), 24.0], te);
+                        if r.changed() {
+                            self.input_duration
+                                .retain(|c| c.is_ascii_digit() || "hmsHMS: ".contains(c));
+                            fields_changed = true;
+                        }
+                    });
+
+                    // Offset
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Offset (First Timer):")
+                                .color(TEXT_WHITE)
+                                .size(14.0),
+                        );
+                        let te = styled_text_edit(&mut self.input_offset, placeholder, true);
+                        let r = ui.add_sized([ui.available_width(), 24.0], te);
+                        if r.changed() {
+                            self.input_offset
+                                .retain(|c| c.is_ascii_digit() || "hmsHMS: ".contains(c));
+                            fields_changed = true;
+                        }
+                    });
+
+                    // Speed slider — full width
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Speed:").color(TEXT_WHITE).size(14.0));
+                        let value_width = 45.0;
+                        let spacing = ui.spacing().item_spacing.x;
+                        let slider_width = (ui.available_width() - value_width - spacing).max(60.0);
+                        ui.spacing_mut().slider_width = slider_width;
+                        ui.add(
+                            egui::Slider::new(&mut self.speed_pct, 50..=200)
+                                .show_value(false)
+                                .step_by(1.0),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.2}x",
+                                self.speed_pct as f64 / 100.0
+                            ))
+                            .color(TEXT_WHITE)
+                            .size(14.0),
+                        );
+                    });
+
+                    if fields_changed {
+                        self.update_field_states();
+                    }
+                });
+
+                // ── Display mode + Time adjust ──
+                ui.horizontal(|ui| {
+                    let mut pb = self.progress_bar_mode;
+                    let cb = ui.checkbox(
+                        &mut pb,
+                        egui::RichText::new("Show Progress Bars")
+                            .color(TEXT_WHITE)
+                            .size(12.0),
+                    );
+                    if cb.changed() {
+                        self.progress_bar_mode = pb;
+                        self.config.progress_bar_mode = pb;
+                        self.config.save();
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if accent_button_sized(ui, "+15s", egui::vec2(50.0, 24.0)).clicked() {
+                            self.adjust_time(15.0);
+                        }
+                        if accent_button_sized(ui, "-15s", egui::vec2(50.0, 24.0)).clicked() {
+                            self.adjust_time(-15.0);
+                        }
+                    });
+                });
+
+                // ── Controls ──
+                ui.horizontal(|ui| {
+                    let btn_width = (ui.available_width() - 16.0) / 3.0;
+
+                    if accent_button_sized(ui, "Start All", egui::vec2(btn_width, 30.0)).clicked()
+                    {
+                        self.start_all();
+                    }
+                    if accent_button_sized(ui, "Pause All", egui::vec2(btn_width, 30.0)).clicked()
+                    {
+                        self.pause_all();
+                    }
+
+                    let clear_btn = egui::Button::new(
+                        egui::RichText::new("Clear All")
+                            .color(TEXT_WHITE)
+                            .family(egui::FontFamily::Name(FONT_BOLD.into()))
+                            .size(14.0),
+                    )
+                    .fill(CLEAR_RED)
+                    .corner_radius(4.0)
+                    .min_size(egui::vec2(btn_width, 30.0));
+                    if ui.add(clear_btn).clicked() {
+                        self.pending_clear = true;
+                    }
+                });
+
+                // Clear confirmation dialog
+                if self.pending_clear {
+                    egui::Window::new("Confirm Clear")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .frame(
+                            egui::Frame::new()
+                                .fill(BG_WIDGET)
+                                .stroke(egui::Stroke::new(1.0, ACCENT))
+                                .corner_radius(8.0)
+                                .inner_margin(16.0),
+                        )
+                        .show(ctx, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Are you sure you want to clear all timers?",
+                                )
+                                .color(TEXT_WHITE)
+                                .size(14.0),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if accent_button_sized(ui, "Yes", egui::vec2(60.0, 28.0)).clicked()
+                                {
+                                    self.pending_clear = false;
+                                    self.clear_all();
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("No")
+                                                .color(TEXT_WHITE)
+                                                .family(egui::FontFamily::Name(FONT_BOLD.into())),
+                                        )
+                                        .fill(BTN_SECONDARY)
+                                        .corner_radius(4.0)
+                                        .min_size(egui::vec2(60.0, 28.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.pending_clear = false;
+                                }
+                            });
+                        });
+                }
+
+                ui.separator();
+
+                // ── Timers List ──
+
+                // Determine display mode for each timer:
+                // 0 = countdown text, 1 = progress bar, 2 = dimmed interval label
+                let next_timer_id: Option<u64> = self
+                    .timers
+                    .iter()
+                    .filter(|t| !t.is_alerting && t.remaining_seconds > 0.0)
+                    .min_by(|a, b| {
+                        a.remaining_seconds
+                            .partial_cmp(&b.remaining_seconds)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|t| t.id);
+
+                let pb_mode = self.progress_bar_mode;
+                let interval_s = self.get_effective_interval();
+                let interval_label = {
+                    let secs = interval_s.max(0.0) as u64;
+                    let h = secs / 3600;
+                    let m = (secs % 3600) / 60;
+                    let s = secs % 60;
+                    if h > 0 {
+                        format!("+ {h:02}:{m:02}:{s:02}")
+                    } else {
+                        format!("+ {m:02}:{s:02}")
+                    }
+                };
+
+                // display_mode: 0=text, 1=progress bar, 2=dimmed interval
+                let display_list: Vec<(usize, u8)> = self
+                    .timers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        if t.is_alerting {
+                            (i, 0)
+                        } else if pb_mode && Some(t.id) == next_timer_id {
+                            (i, 1)
+                        } else if pb_mode {
+                            (i, 2)
+                        } else {
+                            (i, 0)
+                        }
+                    })
+                    .collect();
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .max_height(ui.available_height() - 60.0)
+                    .show(ui, |ui| {
+                        let mut silence_ids = Vec::new();
+                        let mut cancel_ids = Vec::new();
+
+                        for &(idx, display_mode) in &display_list {
+                            let timer = &self.timers[idx];
+
+                            let frame_color = if timer.is_alerting { ACCENT } else { BG_WIDGET };
+                            let border_color = if timer.is_alerting {
+                                TEXT_WHITE
+                            } else if display_mode == 2 {
+                                DISABLED_BORDER
+                            } else {
+                                ACCENT
+                            };
+                            let border_width = if timer.is_alerting { 2.0 } else { 1.0 };
+
+                            egui::Frame::new()
+                                .fill(frame_color)
+                                .stroke(egui::Stroke::new(border_width, border_color))
+                                .corner_radius(5.0)
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .outer_margin(egui::Margin::symmetric(0, 2))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        match display_mode {
+                                            1 => {
+                                                // Progress bar for next timer
+                                                let pbar = egui::ProgressBar::new(
+                                                    timer.fraction_remaining(),
+                                                )
+                                                .fill(ACCENT);
+                                                ui.add_sized(
+                                                    [ui.available_width() - 40.0, 20.0],
+                                                    pbar,
+                                                );
+                                            }
+                                            2 => {
+                                                // Dimmed interval label
+                                                ui.add_sized(
+                                                    [ui.available_width() - 40.0, 20.0],
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&interval_label)
+                                                            .color(TEXT_DIM)
+                                                            .italics()
+                                                            .family(egui::FontFamily::Name(
+                                                                FONT_TIMER.into(),
+                                                            ))
+                                                            .size(14.0),
+                                                    ),
+                                                );
+                                            }
+                                            _ => {
+                                                // Countdown text
+                                                let timer_font = egui::FontFamily::Name(
+                                                    FONT_TIMER.into(),
+                                                );
+                                                let text = if timer.is_alerting {
+                                                    egui::RichText::new("00:00")
+                                                        .color(TEXT_WHITE)
+                                                        .family(timer_font)
+                                                        .size(16.0)
+                                                } else {
+                                                    egui::RichText::new(timer.format_time())
+                                                        .color(TEXT_WHITE)
+                                                        .family(timer_font)
+                                                        .size(16.0)
+                                                };
+                                                ui.add_sized(
+                                                    [ui.available_width() - 40.0, 20.0],
+                                                    egui::Label::new(text),
+                                                );
+                                            }
+                                        }
+
+                                        if timer.is_alerting {
+                                            let btn = egui::Button::new(
+                                                egui::RichText::new("SILENCE")
+                                                    .color(ACCENT)
+                                                    .family(egui::FontFamily::Name(
+                                                        FONT_BOLD.into(),
+                                                    )),
+                                            )
+                                            .fill(TEXT_WHITE)
+                                            .corner_radius(3.0);
+                                            if ui.add(btn).clicked() {
+                                                silence_ids.push(timer.id);
+                                            }
+                                        } else {
+                                            let btn = egui::Button::new(
+                                                egui::RichText::new("X")
+                                                    .color(TEXT_WHITE)
+                                                    .family(egui::FontFamily::Name(
+                                                        FONT_BOLD.into(),
+                                                    )),
+                                            )
+                                            .fill(ACCENT)
+                                            .corner_radius(3.0)
+                                            .min_size(egui::vec2(30.0, 20.0));
+                                            if ui.add(btn).clicked() {
+                                                cancel_ids.push(timer.id);
+                                            }
+                                        }
+                                    });
+                                });
+                        }
+
+                        // Process button clicks
+                        for id in silence_ids {
+                            if let Some(t) = self.timers.iter_mut().find(|t| t.id == id) {
+                                t.silence();
+                            }
+                            self.stop_sound();
+                        }
+                        for id in cancel_ids {
+                            self.timers.retain(|t| t.id != id);
+                        }
+                    });
+
+                // ── Sound Section (bottom) ──
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.horizontal(|ui| {
+                        if secondary_button(ui, "Select Alert Sound...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Audio Files", &["wav", "mp3"])
+                                .pick_file()
+                            {
+                                self.sound_file_display = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "Unknown".to_string());
+                                self.config.sound_file = path.to_string_lossy().to_string();
+                                self.config.save();
+                                if let Some(ref mut audio) = self.audio {
+                                    audio.set_sound(path);
+                                }
+                            }
+                        }
+
+                        let has_sound =
+                            self.audio.as_ref().is_some_and(|a| a.sound_path.is_some());
+                        ui.add_enabled_ui(has_sound, |ui| {
+                            if secondary_button(ui, "Preview").clicked() {
+                                if let Some(ref mut audio) = self.audio {
+                                    audio.preview();
+                                }
+                            }
+                        });
+                    });
+
+                    ui.label(
+                        egui::RichText::new(&self.sound_file_display)
+                            .color(TEXT_DIM)
+                            .italics()
+                            .size(11.0),
+                    );
+                });
+            });
+    }
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
+fn main() -> eframe::Result {
+    let icon_data = load_icon();
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([400.0, 600.0])
+            .with_min_inner_size([400.0, 400.0])
+            .with_icon(icon_data),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Cascading Timers",
+        options,
+        Box::new(|cc| Ok(Box::new(CascadingTimersApp::new(cc)))),
+    )
+}
+
+fn load_icon() -> egui::IconData {
+    // Try to load the .ico from parent directory (project root)
+    let ico_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+        .map(|p| p.join("Untitled-5(1).ico"));
+
+    if let Some(path) = ico_path {
+        if let Ok(img) = image::open(&path) {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            return egui::IconData {
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+            };
+        }
+    }
+
+    // Fallback: solid accent-colored icon
+    let size = 32u32;
+    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+    for _ in 0..(size * size) {
+        pixels.extend_from_slice(&[0xFC, 0x03, 0x5E, 0xFF]);
+    }
+    egui::IconData {
+        rgba: pixels,
+        width: size,
+        height: size,
+    }
+}

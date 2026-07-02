@@ -1,0 +1,21 @@
+[package]
+name = "cascading-timers"
+version = "7.0.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.31", features = ["persistence"] }
+egui = "0.31"
+rodio = "0.20"
+rfd = "0.15"
+configparser = "3"
+image = "0.25"
+
+[profile.release]
+opt-level = 2
+strip = true
+lto = "thin"
+
+[[bin]]
+name = "CascadingTimers"
+path = "src/main.rs"
