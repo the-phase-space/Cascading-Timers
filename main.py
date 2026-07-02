@@ -9,7 +9,10 @@ from PyQt6.QtCore import Qt, QTimer, QUrl, QRegularExpression
 from PyQt6.QtGui import QScreen, QRegularExpressionValidator
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
-CONFIG_FILE = 'config.ini'
+if getattr(sys, 'frozen', False):
+    CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), 'config.ini')
+else:
+    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
 
 class TimerWidget(QFrame):
     def __init__(self, duration_seconds, display_mode="text", parent=None):
@@ -21,10 +24,10 @@ class TimerWidget(QFrame):
         self.alert_duration_remaining = 60  # Default 60s alert duration
         self.display_mode = display_mode # "text" or "bar"
         self.parent_window = parent
-        
+
         self.init_ui()
         self.update_display()
-        
+
         # Style
         self.update_style()
 
@@ -67,23 +70,23 @@ class TimerWidget(QFrame):
     def init_ui(self):
         layout = QHBoxLayout()
         self.setLayout(layout)
-        
+
         self.lbl_time = QLabel()
         self.lbl_time.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.lbl_time)
-        
+
         self.pbar = QProgressBar()
         self.pbar.setRange(0, int(self.total_seconds))
         self.pbar.setValue(int(self.remaining_seconds))
         self.pbar.setTextVisible(False) # Or true if we want text inside
         self.pbar.hide()
         layout.addWidget(self.pbar)
-        
+
         self.btn_cancel = QPushButton("X")
         self.btn_cancel.setFixedWidth(30)
         self.btn_cancel.clicked.connect(self.request_delete)
         layout.addWidget(self.btn_cancel)
-        
+
         self.btn_silence = QPushButton("SILENCE")
         self.btn_silence.clicked.connect(self.silence)
         self.btn_silence.hide() # Hidden by default
@@ -107,11 +110,11 @@ class TimerWidget(QFrame):
              self.lbl_time.setText(f"{h:02}:{m:02}:{s:02}")
         else:
              self.lbl_time.setText(f"{m:02}:{s:02}")
-        
+
         # Update Bar
         if self.display_mode == "bar":
              self.pbar.setValue(int(self.remaining_seconds))
-             
+
         if self.is_alerting:
             # Alert Style
             self.setStyleSheet("""
@@ -160,8 +163,8 @@ class TimerWidget(QFrame):
             self.parent_window.remove_timer_from_list(self)
 
     def request_delete(self):
-        # Confirmation skipped for individual delete per spec implication of "quick", 
-        # but user said "Cancel All prompts 'are you sure'". 
+        # Confirmation skipped for individual delete per spec implication of "quick",
+        # but user said "Cancel All prompts 'are you sure'".
         # For individual, user said "individual timers can be CANCELED (upon which they disappear)".
         self.deleteLater()
         if self.parent_window:
@@ -186,7 +189,7 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.setup_sound()
-        
+
         # App-wide heartbeat (1 second)
         self.global_timer = QTimer()
         self.global_timer.timeout.connect(self.global_tick)
@@ -213,19 +216,19 @@ class MainWindow(QMainWindow):
         self.setFixedWidth(400)
         self.setMinimumHeight(400)
         self.base_ui_height = 400  # Approximate height of UI without timers
-        self.timer_widget_height = 45  # Approximate height per timer widget
-        
+        self.timer_widget_height = 62  # Height per timer widget
+
         # Spec Colors
         # Background: #010421, Accent: #fc035e
         self.setStyleSheet("""
             QMainWindow { background-color: #010421; }
             QWidget { background-color: #010421; color: white; }
             QLabel { font-size: 14px; }
-            QLineEdit { 
-                background-color: #0d112b; 
-                border: 1px solid #fc035e; 
-                color: white; 
-                padding: 5px; 
+            QLineEdit {
+                background-color: #0d112b;
+                border: 1px solid #fc035e;
+                color: white;
+                padding: 5px;
                 border-radius: 3px;
             }
             QPushButton {
@@ -255,10 +258,10 @@ class MainWindow(QMainWindow):
         # --- Settings Section ---
         settings_frame = QFrame()
         settings_layout = QVBoxLayout(settings_frame)
-        
+
         # Time input validator - only allow digits, h, m, s, colons, spaces
         self.time_validator = QRegularExpressionValidator(QRegularExpression(r"[0-9hmsHMS: ]*"))
-        self.time_placeholder = "e.g. 1h 30m, 0:10:00, 90s"
+        self.time_placeholder = "e.g. 1h 30m, 0:10:00, 90 (=90m)"
 
         # Interval
         h_interval = QHBoxLayout()
@@ -338,7 +341,7 @@ class MainWindow(QMainWindow):
 
         # Row 3: Display Mode and Time Adjust
         h_controls_extra = QHBoxLayout()
-        
+
         self.chk_progressbar = QCheckBox("Show Progress Bars (No Text)")
         self.chk_progressbar.setStyleSheet("""
             QCheckBox { color: white; spacing: 5px; }
@@ -348,37 +351,37 @@ class MainWindow(QMainWindow):
         self.chk_progressbar.setChecked(self.config['Settings'].getboolean('progress_bar_mode', False))
         self.chk_progressbar.toggled.connect(self.on_display_mode_changed)
         h_controls_extra.addWidget(self.chk_progressbar)
-        
+
         h_controls_extra.addStretch()
-        
+
         btn_minus = QPushButton("-15s")
         btn_minus.setFixedWidth(50)
         btn_minus.clicked.connect(lambda: self.adjust_time(-15))
         h_controls_extra.addWidget(btn_minus)
-        
+
         btn_plus = QPushButton("+15s")
         btn_plus.setFixedWidth(50)
         btn_plus.clicked.connect(lambda: self.adjust_time(15))
         h_controls_extra.addWidget(btn_plus)
-        
+
         main_layout.addLayout(h_controls_extra)
 
         # --- Controls ---
         controls_layout = QHBoxLayout()
-        
+
         self.btn_start = QPushButton("Start All")
         self.btn_start.clicked.connect(self.start_all)
         controls_layout.addWidget(self.btn_start)
-        
+
         self.btn_pause = QPushButton("Pause All")
         self.btn_pause.clicked.connect(self.pause_all)
         controls_layout.addWidget(self.btn_pause)
-        
+
         self.btn_clear_all = QPushButton("Clear All")
         self.btn_clear_all.setStyleSheet("background-color: #ab0000;")
         self.btn_clear_all.clicked.connect(self.clear_all)
         controls_layout.addWidget(self.btn_clear_all)
-        
+
         main_layout.addLayout(controls_layout)
 
         # --- Timers List ---
@@ -388,29 +391,29 @@ class MainWindow(QMainWindow):
         self.timers_layout = QVBoxLayout(self.scroll_content)
         self.timers_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.scroll_area.setWidget(self.scroll_content)
-        
+
         main_layout.addWidget(self.scroll_area)
-        
+
         # Sound Section
         sound_layout = QVBoxLayout()
-        
+
         self.lbl_sound_name = QLabel("No sound selected")
         self.lbl_sound_name.setStyleSheet("color: #aaa; font-style: italic; font-size: 11px;")
         sound_layout.addWidget(self.lbl_sound_name)
 
         sound_controls = QHBoxLayout()
-        
+
         self.btn_sound = QPushButton("Select Alert Sound...")
         self.btn_sound.clicked.connect(self.select_sound)
         self.btn_sound.setStyleSheet("background-color: #333; font-size: 11px; padding: 4px;")
         sound_controls.addWidget(self.btn_sound)
-        
+
         self.btn_preview = QPushButton("Preview")
         self.btn_preview.clicked.connect(self.preview_sound)
         self.btn_preview.setStyleSheet("background-color: #333; font-size: 11px; padding: 4px;")
         self.btn_preview.setDisabled(True)
         sound_controls.addWidget(self.btn_preview)
-        
+
         sound_layout.addLayout(sound_controls)
         main_layout.addLayout(sound_layout)
 
@@ -422,11 +425,11 @@ class MainWindow(QMainWindow):
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
         self.audio_output.setVolume(1.0)
-        
+
         self.preview_timer = QTimer()
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self.stop_preview)
-        
+
         # Audio timeout (4 minutes)
         self.audio_timeout_timer = QTimer()
         self.audio_timeout_timer.setSingleShot(True)
@@ -505,7 +508,7 @@ class MainWindow(QMainWindow):
         total = 0
         time_str = time_str.lower().strip()
         if not time_str: return 0
-        
+
         # Check for HH:MM:SS format
         if ':' in time_str:
             parts = time_str.split(':')
@@ -517,9 +520,9 @@ class MainWindow(QMainWindow):
             except ValueError:
                 return 0
             return total
-        
+
         parts = time_str.split()
-        
+
         for part in parts:
             if part.endswith('h'):
                 total += int(float(part[:-1]) * 3600)
@@ -528,7 +531,7 @@ class MainWindow(QMainWindow):
             elif part.endswith('s'):
                 total += int(float(part[:-1]))
             elif part.isdigit():
-                 total += int(part)
+                total += int(part) * 60  # Raw numbers default to minutes
         return total
 
     def get_friendly_time(self, seconds):
@@ -539,7 +542,7 @@ class MainWindow(QMainWindow):
         return f"{seconds}s"
 
     # --- Logic ---
-    
+
     def adjust_time(self, delta_seconds):
         # Subtract/Add time to all NONZERO timers
         for t in self.timers:
@@ -554,7 +557,7 @@ class MainWindow(QMainWindow):
                 # tick() logic: if rem > 0 -> rem -= 1 ... if rem == 0 -> alert.
                 # If we set rem=0 here, the next tick() will see 0.
                 # But modify: tick check is "if remaining > 0: ... if remaining == 0"
-                # If we set to 0 here, next tick sees 0. It won't decrement. 
+                # If we set to 0 here, next tick sees 0. It won't decrement.
                 # It won't enter "remaining > 0" block.
                 # It won't trigger start_alert().
                 # Fix: If we set to 0, call start_alert?
@@ -813,23 +816,23 @@ class MainWindow(QMainWindow):
                 count = self.calculated_count
 
             if count <= 0: return
-            
+
             # 2.5 Cap at 20 per request
-            if count > 20: 
+            if count > 20:
                 count = 20
 
             # 3. Create Widgets
             mode = "bar" if self.chk_progressbar.isChecked() else "text"
-            
+
             offset_s = self.parse_time_str(self.input_offset.text())
             start_base = offset_s if offset_s > 0 else interval_s
-            
+
             for i in range(count):
                 # i=0 -> start_base
                 # i=1 -> start_base + interval
                 # ...
                 duration = start_base + (i * interval_s)
-                
+
                 t_widget = TimerWidget(duration, display_mode=mode, parent=self)
                 t_widget.parent_window = self
                 self.timers.append(t_widget)
@@ -855,7 +858,7 @@ class MainWindow(QMainWindow):
     def start_all(self):
         if not self.timers:
             self.rebuild_timers()
-        
+
         for t in self.timers:
             t.set_active(True)
         self.is_paused = False
@@ -867,9 +870,9 @@ class MainWindow(QMainWindow):
         self.stop_sound()
 
     def clear_all(self):
-        reply = QMessageBox.question(self, 'Confirm Clear', 
+        reply = QMessageBox.question(self, 'Confirm Clear',
                                      "Are you sure you want to clear all timers?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                      QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.pause_all()
