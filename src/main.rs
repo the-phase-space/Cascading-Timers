@@ -15,6 +15,7 @@ const DISABLED_BORDER: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55)
 const CLEAR_RED: egui::Color32 = egui::Color32::from_rgb(0xAB, 0x00, 0x00);
 const BTN_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
 const RESET_GREEN: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x8A, 0x2A);
+const ERR_RED: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x55, 0x55);
 
 // ─── Config persistence ──────────────────────────────────────────────────────
 fn config_path() -> PathBuf {
@@ -32,6 +33,8 @@ struct Config {
     sound_file: String,
     final_sound_file: String,
     progress_bar_mode: bool,
+    geometric_enabled: bool,
+    geometric_ratio: String,
 }
 
 impl Config {
@@ -49,6 +52,11 @@ impl Config {
                         .get("Settings", "progress_bar_mode")
                         .unwrap_or_default()
                         .eq_ignore_ascii_case("true"),
+                    geometric_enabled: conf
+                        .get("Settings", "geometric_enabled")
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case("true"),
+                    geometric_ratio: conf.get("Settings", "geometric_ratio").unwrap_or_default(),
                 };
             }
         }
@@ -66,6 +74,12 @@ impl Config {
             "progress_bar_mode",
             Some(if self.progress_bar_mode { "True" } else { "False" }.to_string()),
         );
+        conf.set(
+            "Settings",
+            "geometric_enabled",
+            Some(if self.geometric_enabled { "True" } else { "False" }.to_string()),
+        );
+        conf.set("Settings", "geometric_ratio", Some(self.geometric_ratio.clone()));
         let _ = conf.write(config_path().to_string_lossy().as_ref());
     }
 }
@@ -78,6 +92,8 @@ impl Default for Config {
             sound_file: String::new(),
             final_sound_file: String::new(),
             progress_bar_mode: false,
+            geometric_enabled: false,
+            geometric_ratio: String::new(),
         }
     }
 }
@@ -349,6 +365,47 @@ enum DisabledField {
     Interval,
     Count,
     Duration,
+    Ratio,
+}
+
+/// Format a duration in seconds as a re-parseable time string, preserving
+/// sub-second precision (up to centiseconds) when present. Whole seconds render
+/// as "H:MM:SS" / "M:SS"; fractional seconds append e.g. "M:SS.dd".
+fn format_secs_precise(secs: f64) -> String {
+    if secs <= 0.0 {
+        return String::new();
+    }
+    // Round to centiseconds up front so the fractional part never rounds to 1.00.
+    let total = (secs * 100.0).round() / 100.0;
+    let whole = total.floor() as u64;
+    let frac = total - whole as f64;
+    let h = whole / 3600;
+    let m = (whole % 3600) / 60;
+    let s = whole % 60;
+    let frac_str = if frac > 1e-9 {
+        // "0.dd" → ".dd" with trailing zeros trimmed
+        let f = format!("{frac:.2}");
+        let trimmed = f.trim_start_matches('0').trim_end_matches('0').trim_end_matches('.');
+        trimmed.to_string()
+    } else {
+        String::new()
+    };
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}{frac_str}")
+    } else {
+        format!("{m}:{s:02}{frac_str}")
+    }
+}
+
+/// Sum of the geometric series 1 + r + r² + … + r^(n-1).
+fn geom_sum(r: f64, n: u32) -> f64 {
+    if n == 0 {
+        0.0
+    } else if (r - 1.0).abs() < 1e-12 {
+        n as f64
+    } else {
+        (r.powi(n as i32) - 1.0) / (r - 1.0)
+    }
 }
 
 // ─── App ─────────────────────────────────────────────────────────────────────
@@ -358,13 +415,19 @@ struct CascadingTimersApp {
     input_count: String,
     input_duration: String,
     input_offset: String,
+    input_ratio: String,
 
     // Calculated values for disabled fields
     calculated_interval: f64,
     calculated_count: u32,
     calculated_duration: f64,
+    calculated_ratio: f64,
 
     disabled_field: DisabledField,
+
+    // Geometric series
+    geometric_enabled: bool,
+    geom_invalid: bool, // a geometric solve had no valid solution
 
     // Speed
     speed_pct: u32, // 50..=200, representing 0.50x to 2.00x
@@ -503,12 +566,17 @@ impl CascadingTimersApp {
             input_count: String::new(),
             input_duration: String::new(),
             input_offset: String::new(),
+            input_ratio: config.geometric_ratio.clone(),
 
             calculated_interval: 0.0,
             calculated_count: 0,
             calculated_duration: 0.0,
+            calculated_ratio: 0.0,
 
             disabled_field: DisabledField::None,
+
+            geometric_enabled: config.geometric_enabled,
+            geom_invalid: false,
 
             speed_pct: 100,
 
@@ -558,7 +626,57 @@ impl CascadingTimersApp {
         s.parse::<u32>().is_ok_and(|v| v > 0)
     }
 
+    fn is_valid_ratio(s: &str) -> bool {
+        parse_ratio(s).is_some()
+    }
+
     fn update_field_states(&mut self) {
+        if self.geometric_enabled {
+            self.update_field_states_geometric();
+        } else {
+            // Leaving geometric: release a ratio-computed lock if one is held.
+            if self.disabled_field == DisabledField::Ratio {
+                self.set_disabled_field(DisabledField::None);
+            }
+            self.geom_invalid = false;
+            self.update_field_states_normal();
+        }
+    }
+
+    /// Switch which field is computed/locked, clearing the display buffer of the
+    /// field that is being released back to user control.
+    fn set_disabled_field(&mut self, new_df: DisabledField) {
+        if self.disabled_field == new_df {
+            return;
+        }
+        match self.disabled_field {
+            DisabledField::Interval => self.input_interval.clear(),
+            DisabledField::Count => self.input_count.clear(),
+            DisabledField::Duration => self.input_duration.clear(),
+            DisabledField::Ratio => self.input_ratio.clear(),
+            DisabledField::None => {}
+        }
+        self.disabled_field = new_df;
+    }
+
+    /// Write the current computed value into the locked field's display buffer
+    /// (full precision lives in calculated_*; the buffer is display-only).
+    fn sync_computed_display(&mut self) {
+        match self.disabled_field {
+            DisabledField::Interval => {
+                self.input_interval = format_secs_precise(self.calculated_interval)
+            }
+            DisabledField::Count => self.input_count = self.calculated_count.to_string(),
+            DisabledField::Duration => {
+                self.input_duration = format_secs_precise(self.calculated_duration)
+            }
+            DisabledField::Ratio => self.input_ratio = format!("{:.4}", self.calculated_ratio),
+            DisabledField::None => {}
+        }
+    }
+
+    /// Normal (arithmetic) two-of-three among Interval / Count / Duration.
+    fn update_field_states_normal(&mut self) {
         let interval_filled =
             self.disabled_field != DisabledField::Interval && Self::is_valid_time(&self.input_interval);
         let count_filled =
@@ -569,23 +687,83 @@ impl CascadingTimersApp {
         let filled = interval_filled as u8 + count_filled as u8 + duration_filled as u8;
 
         if filled >= 2 {
-            if !interval_filled {
-                self.disabled_field = DisabledField::Interval;
-                self.calculate_interval();
+            let target = if !interval_filled {
+                DisabledField::Interval
             } else if !count_filled {
-                self.disabled_field = DisabledField::Count;
-                self.calculate_count();
+                DisabledField::Count
             } else if !duration_filled {
-                self.disabled_field = DisabledField::Duration;
-                self.calculate_duration();
+                DisabledField::Duration
             } else {
-                // All three filled — prefer interval+count, recalculate duration
-                self.disabled_field = DisabledField::Duration;
-                self.calculate_duration();
+                // All three filled — prefer interval+count, recalculate duration.
+                DisabledField::Duration
+            };
+            self.set_disabled_field(target);
+            match target {
+                DisabledField::Interval => self.calculate_interval(),
+                DisabledField::Count => self.calculate_count(),
+                DisabledField::Duration => self.calculate_duration(),
+                _ => {}
+            }
+            self.sync_computed_display();
+            self.needs_rebuild = true;
+        } else {
+            self.set_disabled_field(DisabledField::None);
+        }
+    }
+
+    /// Geometric two-of-three among Interval / Ratio / Duration. Count is always
+    /// a required input (a geometric series needs an explicit term count).
+    fn update_field_states_geometric(&mut self) {
+        if !Self::is_valid_count(&self.input_count) {
+            self.set_disabled_field(DisabledField::None);
+            self.geom_invalid = false;
+            return;
+        }
+
+        let i_user =
+            self.disabled_field != DisabledField::Interval && Self::is_valid_time(&self.input_interval);
+        let r_user =
+            self.disabled_field != DisabledField::Ratio && Self::is_valid_ratio(&self.input_ratio);
+        let d_user =
+            self.disabled_field != DisabledField::Duration && Self::is_valid_time(&self.input_duration);
+
+        let provided = i_user as u8 + r_user as u8 + d_user as u8;
+
+        if provided >= 2 {
+            // The blank field of the trio is solved & locked. If all three are
+            // present (only transiently), keep Interval+Ratio and derive Duration.
+            let target = if !i_user {
+                DisabledField::Interval
+            } else if !d_user {
+                DisabledField::Duration
+            } else if !r_user {
+                DisabledField::Ratio
+            } else {
+                DisabledField::Duration
+            };
+            self.set_disabled_field(target);
+            let ok = match target {
+                DisabledField::Interval => self.calculate_interval_geom(),
+                DisabledField::Duration => self.calculate_duration_geom(),
+                DisabledField::Ratio => self.calculate_ratio_geom(),
+                _ => false,
+            };
+            self.geom_invalid = !ok;
+            if ok {
+                self.sync_computed_display();
+            } else {
+                // No valid solution — blank the locked field (UI flags it red).
+                match target {
+                    DisabledField::Interval => self.input_interval.clear(),
+                    DisabledField::Duration => self.input_duration.clear(),
+                    DisabledField::Ratio => self.input_ratio.clear(),
+                    _ => {}
+                }
             }
             self.needs_rebuild = true;
         } else {
-            self.disabled_field = DisabledField::None;
+            self.set_disabled_field(DisabledField::None);
+            self.geom_invalid = false;
         }
     }
 
@@ -602,7 +780,94 @@ impl CascadingTimersApp {
             total_duration / count
         };
         if interval > 0.0 {
-            self.calculated_interval = interval.floor();
+            self.calculated_interval = interval; // full precision (no flooring)
+        }
+    }
+
+    // ── Geometric solves (offset-free; offset is applied last at build time) ──
+    // Series of `n` gaps a·r⁰ … a·r^(n-1); total D = a·(rⁿ−1)/(r−1).
+
+    fn calculate_duration_geom(&mut self) -> bool {
+        let a = parse_time_str(&self.input_interval);
+        let r = parse_ratio(&self.input_ratio).unwrap_or(0.0);
+        let n = self.input_count.trim().parse::<u32>().unwrap_or(0);
+        if a <= 0.0 || r <= 0.0 || n == 0 {
+            return false;
+        }
+        self.calculated_duration = a * geom_sum(r, n);
+        self.calculated_duration > 0.0 && self.calculated_duration.is_finite()
+    }
+
+    fn calculate_interval_geom(&mut self) -> bool {
+        let r = parse_ratio(&self.input_ratio).unwrap_or(0.0);
+        let d = parse_time_str(&self.input_duration);
+        let n = self.input_count.trim().parse::<u32>().unwrap_or(0);
+        if r <= 0.0 || d <= 0.0 || n == 0 {
+            return false;
+        }
+        let s = geom_sum(r, n);
+        if s <= 0.0 || !s.is_finite() {
+            return false;
+        }
+        self.calculated_interval = d / s;
+        self.calculated_interval > 0.0 && self.calculated_interval.is_finite()
+    }
+
+    fn calculate_ratio_geom(&mut self) -> bool {
+        let a = parse_time_str(&self.input_interval);
+        let d = parse_time_str(&self.input_duration);
+        let n = self.input_count.trim().parse::<u32>().unwrap_or(0);
+        if a <= 0.0 || d <= 0.0 || n == 0 {
+            return false;
+        }
+        if n == 1 {
+            // One timer: its only gap is the base interval; ratio is irrelevant.
+            // Valid only if the requested duration equals the base interval.
+            self.calculated_ratio = 1.0;
+            return (d - a).abs() <= 1e-6 * a.max(1.0);
+        }
+        let nn = n as f64;
+        // f(r) = a·geom_sum(r,n) is strictly increasing on r>0, ranging (a, ∞),
+        // with f(1) = a·n. So a valid r>0 exists iff d > a.
+        if d <= a {
+            self.calculated_ratio = 0.0;
+            return false;
+        }
+        if (d - a * nn).abs() <= 1e-9 * (a * nn) {
+            self.calculated_ratio = 1.0;
+            return true;
+        }
+        let f = |r: f64| a * geom_sum(r, n);
+        let (mut lo, mut hi) = if d < a * nn {
+            (1e-9_f64, 1.0_f64)
+        } else {
+            let mut hi = 2.0_f64;
+            let mut guard = 0;
+            while f(hi) < d && guard < 300 {
+                hi *= 2.0;
+                guard += 1;
+            }
+            (1.0_f64, hi)
+        };
+        let mut r = 0.5 * (lo + hi);
+        for _ in 0..200 {
+            r = 0.5 * (lo + hi);
+            let val = f(r);
+            if (val - d).abs() <= 1e-9 * d.max(1.0) {
+                break;
+            }
+            if val < d {
+                lo = r;
+            } else {
+                hi = r;
+            }
+        }
+        if r > 0.0 && r.is_finite() {
+            self.calculated_ratio = r;
+            true
+        } else {
+            self.calculated_ratio = 0.0;
+            false
         }
     }
 
@@ -658,6 +923,14 @@ impl CascadingTimersApp {
         }
     }
 
+    fn get_effective_ratio(&self) -> f64 {
+        if self.disabled_field == DisabledField::Ratio {
+            self.calculated_ratio
+        } else {
+            parse_ratio(&self.input_ratio).unwrap_or(0.0)
+        }
+    }
+
     fn rebuild_timers(&mut self) {
         if self.timers_running {
             return;
@@ -665,36 +938,57 @@ impl CascadingTimersApp {
 
         self.timers.clear();
 
-        let interval_s = self.get_effective_interval();
-        if interval_s <= 0.0 {
-            return;
-        }
-
         let count = self.get_effective_count().min(20);
         if count == 0 {
             return;
         }
 
-        let offset_s = parse_time_str(&self.input_offset);
-        let start_base = if offset_s > 0.0 { offset_s } else { interval_s };
+        let interval_s = self.get_effective_interval();
+        if interval_s <= 0.0 {
+            return;
+        }
 
-        for i in 0..count {
-            let duration = start_base + (i as f64) * interval_s;
-            let id = self.next_timer_id;
-            self.next_timer_id += 1;
-            self.timers.push(Timer::new(id, duration));
+        let offset_s = parse_time_str(&self.input_offset);
+
+        if self.geometric_enabled {
+            let r = self.get_effective_ratio();
+            if r <= 0.0 || self.geom_invalid {
+                return;
+            }
+            // Each timer's countdown is the cumulative fire time. The first gap is
+            // the base interval (a·r⁰), or the offset when set — which overrides it.
+            // Every later gap k is a·rᵏ and never adapts to the offset, so the tail
+            // keeps its original geometric spacing.
+            let mut cumulative = 0.0;
+            for i in 0..count {
+                let gap = if i == 0 {
+                    if offset_s > 0.0 { offset_s } else { interval_s }
+                } else {
+                    interval_s * r.powi(i as i32)
+                };
+                cumulative += gap;
+                let id = self.next_timer_id;
+                self.next_timer_id += 1;
+                self.timers.push(Timer::new(id, cumulative));
+            }
+        } else {
+            let start_base = if offset_s > 0.0 { offset_s } else { interval_s };
+            for i in 0..count {
+                let duration = start_base + (i as f64) * interval_s;
+                let id = self.next_timer_id;
+                self.next_timer_id += 1;
+                self.timers.push(Timer::new(id, duration));
+            }
         }
 
         self.completed_timer_durations = self.timers.iter().map(|t| t.total_seconds).collect();
 
-        // Save to config
-        if interval_s > 0.0 {
-            self.config.interval = format!("{}", interval_s as u64);
-            if count > 0 {
-                self.config.timer_count = format!("{count}");
-            }
-            self.config.save();
-        }
+        // Persist (full precision; these are launch defaults, not reloaded into the UI).
+        self.config.interval = format!("{interval_s}");
+        self.config.timer_count = format!("{count}");
+        self.config.geometric_enabled = self.geometric_enabled;
+        self.config.geometric_ratio = self.input_ratio.clone();
+        self.config.save();
     }
 
     fn start_all(&mut self) {
@@ -747,10 +1041,23 @@ impl CascadingTimersApp {
         self.timers.clear();
         self.timers_running = false;
         self.all_timers_completed = false;
+        // Keep a user-typed interval (reusable rate), but drop an auto-computed one
+        // so a stale autofilled value doesn't linger after a clear.
+        if self.disabled_field == DisabledField::Interval {
+            self.input_interval.clear();
+        }
         self.input_count.clear();
         self.input_duration.clear();
         self.input_offset.clear();
+        self.input_ratio.clear();
+        self.geom_invalid = false;
+        self.geometric_enabled = false;
+        self.speed_pct = 100; // reset to 1.00x
         self.disabled_field = DisabledField::None;
+        // Persist the reset mode flags so they don't silently reappear on relaunch.
+        self.config.geometric_enabled = false;
+        self.config.geometric_ratio = String::new();
+        self.config.save();
     }
 
     fn adjust_time(&mut self, delta: f64) {
@@ -929,6 +1236,47 @@ fn styled_text_edit<'a>(text: &'a mut String, hint: &'a str, enabled: bool) -> e
         .interactive(enabled)
 }
 
+/// Restrict a ratio buffer to digits, decimal points, and a fraction slash.
+fn sanitize_ratio(s: &mut String) {
+    s.retain(|c| c.is_ascii_digit() || c == '.' || c == '/');
+}
+
+/// Parse a geometric ratio. Accepts plain decimals ("1.5", ".5", "2") and
+/// fractions ("3/2", "1.5/2"). Returns the value only if it is finite and > 0.
+fn parse_ratio(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let v = if let Some((num, den)) = s.split_once('/') {
+        let n = num.trim().parse::<f64>().ok()?;
+        let d = den.trim().parse::<f64>().ok()?;
+        if d == 0.0 {
+            return None;
+        }
+        n / d
+    } else {
+        s.parse::<f64>().ok()?
+    };
+    (v > 0.0 && v.is_finite()).then_some(v)
+}
+
+/// On blur: pad a short decimal ratio out to 4 places ("1.5" → "1.5000"),
+/// but leave fractions and longer-than-4-decimal values exactly as typed so a
+/// deliberately precise ratio is preserved (just visually overflows the field).
+fn auto_extend_ratio(s: &mut String) {
+    let t = s.trim();
+    if t.is_empty() || t.contains('/') {
+        return;
+    }
+    if let Ok(v) = t.parse::<f64>() {
+        let decimals = t.split('.').nth(1).map(|d| d.len()).unwrap_or(0);
+        if decimals < 4 {
+            *s = format!("{v:.4}");
+        }
+    }
+}
+
 // ─── eframe impl ─────────────────────────────────────────────────────────────
 
 impl eframe::App for CascadingTimersApp {
@@ -952,9 +1300,9 @@ impl eframe::App for CascadingTimersApp {
             self.rebuild_timers();
             let new_count = self.timers.len();
             if new_count != old_count {
-                const BASE_HEIGHT: f32 = 375.0;
+                const BASE_HEIGHT: f32 = 405.0;
                 const PER_TIMER: f32 = 46.0;
-                let target = (BASE_HEIGHT + new_count as f32 * PER_TIMER).clamp(400.0, 1200.0);
+                let target = (BASE_HEIGHT + new_count as f32 * PER_TIMER).clamp(430.0, 1200.0);
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
                     egui::vec2(ctx.screen_rect().width().max(400.0), target),
                 ));
@@ -995,7 +1343,8 @@ impl eframe::App for CascadingTimersApp {
                         ui.label(
                             egui::RichText::new("Interval:").color(TEXT_WHITE).size(14.0),
                         );
-                        let enabled = self.disabled_field != DisabledField::Interval;
+                        let enabled =
+                            !self.timers_running && self.disabled_field != DisabledField::Interval;
                         let te = styled_text_edit(&mut self.input_interval, placeholder, enabled);
                         let r = ui.add_sized([ui.available_width(), 24.0], te);
                         if r.changed() {
@@ -1010,7 +1359,8 @@ impl eframe::App for CascadingTimersApp {
                         ui.label(
                             egui::RichText::new("Timer Count:").color(TEXT_WHITE).size(14.0),
                         );
-                        let enabled = self.disabled_field != DisabledField::Count;
+                        let enabled =
+                            !self.timers_running && self.disabled_field != DisabledField::Count;
                         let te = styled_text_edit(&mut self.input_count, "", enabled);
                         let r = ui.add_sized([ui.available_width(), 24.0], te);
                         if r.changed() {
@@ -1031,7 +1381,8 @@ impl eframe::App for CascadingTimersApp {
                                 .color(TEXT_WHITE)
                                 .size(14.0),
                         );
-                        let enabled = self.disabled_field != DisabledField::Duration;
+                        let enabled =
+                            !self.timers_running && self.disabled_field != DisabledField::Duration;
                         let te = styled_text_edit(&mut self.input_duration, placeholder, enabled);
                         let r = ui.add_sized([ui.available_width(), 24.0], te);
                         if r.changed() {
@@ -1048,7 +1399,8 @@ impl eframe::App for CascadingTimersApp {
                                 .color(TEXT_WHITE)
                                 .size(14.0),
                         );
-                        let te = styled_text_edit(&mut self.input_offset, placeholder, true);
+                        let te =
+                            styled_text_edit(&mut self.input_offset, placeholder, !self.timers_running);
                         let r = ui.add_sized([ui.available_width(), 24.0], te);
                         if r.changed() {
                             self.input_offset
@@ -1067,7 +1419,7 @@ impl eframe::App for CascadingTimersApp {
                         ui.add(
                             egui::Slider::new(&mut self.speed_pct, 50..=200)
                                 .show_value(false)
-                                .step_by(1.0),
+                                .step_by(5.0), // 0.05x steps
                         );
                         ui.label(
                             egui::RichText::new(format!(
@@ -1084,32 +1436,126 @@ impl eframe::App for CascadingTimersApp {
                     }
                 });
 
-                // ── Display mode + Time adjust ──
+                // ── Geometric + Display mode (two stacked rows) · Time adjust ──
+                // The ±15s buttons grow to span both checkbox rows; the top/bottom
+                // margins to the settings group and the controls row stay put.
                 ui.horizontal(|ui| {
-                    let mut pb = self.progress_bar_mode;
-                    let old_pad = ui.spacing().button_padding;
-                    ui.spacing_mut().button_padding.y = 3.5;
-                    let cb = ui.checkbox(
-                        &mut pb,
-                        egui::RichText::new("Show Progress Bars")
-                            .color(TEXT_WHITE)
-                            .size(12.0),
-                    );
-                    ui.spacing_mut().button_padding = old_pad;
-                    if cb.changed() {
-                        self.progress_bar_mode = pb;
-                        self.config.progress_bar_mode = pb;
-                        self.config.save();
-                    }
+                    let cohort_live = self.timers_running;
+                    let row_h = 24.0_f32;
+                    let gap = ui.spacing().item_spacing.y;
+                    let tall_h = row_h * 2.0 + gap;
 
+                    let btn_w = 50.0_f32;
+                    let sp = ui.spacing().item_spacing.x;
+                    let button_area = btn_w * 2.0 + sp;
+                    let left_w = (ui.available_width() - button_area - sp).max(140.0);
+
+                    let mut geo_changed = false;
+
+                    ui.vertical(|ui| {
+                        ui.set_width(left_w);
+
+                        // Row 1 (top): Geometric Series checkbox + ratio entry
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(left_w, row_h),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let old_pad = ui.spacing().button_padding;
+                                ui.spacing_mut().button_padding.y = 3.5;
+                                let mut geo = self.geometric_enabled;
+                                let cb = ui.add_enabled(
+                                    !cohort_live,
+                                    egui::Checkbox::new(
+                                        &mut geo,
+                                        egui::RichText::new("Geometric Series")
+                                            .color(if cohort_live { TEXT_DIM } else { TEXT_WHITE })
+                                            .size(12.0),
+                                    ),
+                                );
+                                ui.spacing_mut().button_padding = old_pad;
+                                if cb.changed() {
+                                    self.geometric_enabled = geo;
+                                    self.config.geometric_enabled = geo;
+                                    self.config.save();
+                                    geo_changed = true;
+                                }
+
+                                // Ratio entry box (fits "1.0000"). Freely editable
+                                // from a fresh state — no need to check the box first;
+                                // it only greys/locks once a cohort is live or it
+                                // becomes the auto-computed field.
+                                let ratio_computed = self.disabled_field == DisabledField::Ratio;
+                                let ratio_enabled = !cohort_live && !ratio_computed;
+                                let ratio_color =
+                                    if ratio_enabled { TEXT_WHITE } else { DISABLED_BORDER };
+                                let te = egui::TextEdit::singleline(&mut self.input_ratio)
+                                    .hint_text(if ratio_enabled { "ratio" } else { "" })
+                                    .text_color(ratio_color)
+                                    .horizontal_align(egui::Align::Center)
+                                    .interactive(ratio_enabled);
+                                let r = ui.add_sized([56.0, row_h - 2.0], te);
+                                if r.changed() {
+                                    sanitize_ratio(&mut self.input_ratio);
+                                    // Only the cascade calc cares about the ratio, so
+                                    // typing it while the mode is off does nothing yet.
+                                    if self.geometric_enabled {
+                                        geo_changed = true;
+                                    }
+                                }
+                                if r.lost_focus() {
+                                    auto_extend_ratio(&mut self.input_ratio);
+                                }
+
+                                if self.geometric_enabled && self.geom_invalid {
+                                    ui.label(
+                                        egui::RichText::new("!").color(ERR_RED).strong().size(15.0),
+                                    )
+                                    .on_hover_text(
+                                        "No geometric series fits those values \
+                                         (Total Duration must exceed the base Interval).",
+                                    );
+                                }
+                            },
+                        );
+
+                        // Row 2 (bottom): Show Progress Bars checkbox
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(left_w, row_h),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let old_pad = ui.spacing().button_padding;
+                                ui.spacing_mut().button_padding.y = 3.5;
+                                let mut pb = self.progress_bar_mode;
+                                let cb = ui.checkbox(
+                                    &mut pb,
+                                    egui::RichText::new("Show Progress Bars")
+                                        .color(TEXT_WHITE)
+                                        .size(12.0),
+                                );
+                                ui.spacing_mut().button_padding = old_pad;
+                                if cb.changed() {
+                                    self.progress_bar_mode = pb;
+                                    self.config.progress_bar_mode = pb;
+                                    self.config.save();
+                                }
+                            },
+                        );
+                    });
+
+                    // Right: tall +15s / -15s buttons spanning both rows
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if accent_button_sized(ui, "+15s", egui::vec2(50.0, 24.0)).clicked() {
+                        if accent_button_sized(ui, "+15s", egui::vec2(btn_w, tall_h)).clicked() {
                             self.adjust_time(15.0);
                         }
-                        if accent_button_sized(ui, "-15s", egui::vec2(50.0, 24.0)).clicked() {
+                        if accent_button_sized(ui, "-15s", egui::vec2(btn_w, tall_h)).clicked() {
                             self.adjust_time(-15.0);
                         }
                     });
+
+                    if geo_changed {
+                        self.update_field_states();
+                        self.needs_rebuild = true;
+                    }
                 });
 
                 // ── Controls ──
@@ -1238,18 +1684,29 @@ impl eframe::App for CascadingTimersApp {
                     .map(|t| t.id);
 
                 let pb_mode = self.progress_bar_mode;
-                let interval_s = self.get_effective_interval();
-                let interval_label = {
-                    let secs = interval_s.max(0.0) as u64;
-                    let h = secs / 3600;
-                    let m = (secs % 3600) / 60;
-                    let s = secs % 60;
-                    if h > 0 {
-                        format!("+ {h:02}:{m:02}:{s:02}")
-                    } else {
-                        format!("+ {m:02}:{s:02}")
-                    }
-                };
+                // Per-timer gap label: how long after the previous timer this one
+                // fires (= its geometric gap). Computed from cumulative fire times.
+                let gap_labels: Vec<String> = self
+                    .timers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let prev = if i == 0 {
+                            0.0
+                        } else {
+                            self.timers[i - 1].total_seconds
+                        };
+                        let secs = (t.total_seconds - prev).max(0.0) as u64;
+                        let h = secs / 3600;
+                        let m = (secs % 3600) / 60;
+                        let s = secs % 60;
+                        if h > 0 {
+                            format!("+ {h:02}:{m:02}:{s:02}")
+                        } else {
+                            format!("+ {m:02}:{s:02}")
+                        }
+                    })
+                    .collect();
 
                 // display_mode: 0=text, 1=progress bar, 2=dimmed interval
                 let display_list: Vec<(usize, u8)> = self
@@ -1313,11 +1770,11 @@ impl eframe::App for CascadingTimersApp {
                                                 ui.add_sized([content_width, 20.0], pbar);
                                             }
                                             2 => {
-                                                // Dimmed interval label
+                                                // Dimmed gap label (time since previous timer)
                                                 ui.add_sized(
                                                     [content_width, 20.0],
                                                     egui::Label::new(
-                                                        egui::RichText::new(&interval_label)
+                                                        egui::RichText::new(&gap_labels[idx])
                                                             .color(TEXT_DIM)
                                                             .italics()
                                                             .family(egui::FontFamily::Name(
@@ -1590,8 +2047,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 600.0])
-            .with_min_inner_size([400.0, 400.0])
+            .with_inner_size([400.0, 630.0])
+            .with_min_inner_size([400.0, 430.0])
             .with_icon(icon_data),
         ..Default::default()
     };
