@@ -1567,7 +1567,25 @@ impl eframe::App for CascadingTimersApp {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "windows")]
+fn enable_per_monitor_v2_dpi() {
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetProcessDpiAwarenessContext(value: *mut c_void) -> i32;
+    }
+
+    let ctx_per_monitor_v2 = -4isize as *mut c_void;
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(ctx_per_monitor_v2);
+    }
+}
+
 fn main() -> eframe::Result {
+    #[cfg(target_os = "windows")]
+    enable_per_monitor_v2_dpi();
+
     let icon_data = load_icon();
 
     let options = eframe::NativeOptions {

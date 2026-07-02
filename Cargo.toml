@@ -1,6 +1,6 @@
 [package]
 name = "cascading-timers"
-version = "10.0.0"
+version = "11.0.0"
 edition = "2024"
 
 [dependencies]
@@ -23,3 +23,12 @@ path = "src/main.rs"
 
 [build-dependencies]
 winresource = "0.1"
+
+# Patched winit: cherry-picks PR #4341 (commit 488c036) onto v0.30.13 to fix
+# the Windows 11 mixed-DPI dragging bug (winit issue #4041). Without this,
+# dragging the window across monitors with different DPI scaling causes a
+# WM_DPICHANGED feedback loop (window bounces and resizes at the boundary).
+# eframe 0.31.x pulls in winit 0.30.7, and PR #4341 only landed in winit
+# 0.31.0-beta.x, so we vendor a patched 0.30.13 in vendor/winit/.
+[patch.crates-io]
+winit = { path = "vendor/winit" }
