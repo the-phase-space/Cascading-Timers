@@ -1015,30 +1015,38 @@ impl CascadingTimersApp {
 
     fn reset_all(&mut self) {
         self.stop_sound();
-        self.is_paused = true;
-        for t in &mut self.timers {
-            t.remaining_seconds = t.total_seconds;
-            t.is_active = false;
-            t.is_alerting = false;
-            t.marked_for_removal = false;
+        // Restore the entire original regimen as dictated by the settings at build
+        // time — including timers that already fired and were silenced (and were thus
+        // removed from the list). `completed_timer_durations` is the snapshot taken in
+        // `rebuild_timers`, so this rebuilds the full cohort rather than merely resetting
+        // the survivors to their max time. Falls back to resetting whatever timers are
+        // present if no snapshot exists (e.g. nothing has been built yet).
+        if self.completed_timer_durations.is_empty() {
+            for t in &mut self.timers {
+                t.remaining_seconds = t.total_seconds;
+                t.is_active = false;
+                t.is_alerting = false;
+                t.marked_for_removal = false;
+            }
+        } else {
+            self.timers.clear();
+            for &dur in &self.completed_timer_durations {
+                let id = self.next_timer_id;
+                self.next_timer_id += 1;
+                self.timers.push(Timer::new(id, dur));
+            }
         }
-    }
-
-    fn restore_timers(&mut self) {
-        self.stop_sound();
-        self.timers.clear();
-        for &dur in &self.completed_timer_durations {
-            let id = self.next_timer_id;
-            self.next_timer_id += 1;
-            self.timers.push(Timer::new(id, dur));
-        }
         self.is_paused = true;
+        self.timers_running = false;
         self.all_timers_completed = false;
     }
 
     fn clear_all(&mut self) {
         self.pause_all();
         self.timers.clear();
+        // Drop the regimen snapshot so a subsequent Reset can't resurrect the cleared
+        // cohort.
+        self.completed_timer_durations.clear();
         self.timers_running = false;
         self.all_timers_completed = false;
         // Keep a user-typed interval (reusable rate), but drop an auto-computed one
@@ -1601,7 +1609,7 @@ impl eframe::App for CascadingTimersApp {
                         .corner_radius(4.0)
                         .min_size(egui::vec2(btn_width, 30.0));
                         if ui.add(reset_all_btn).clicked() {
-                            self.restore_timers();
+                            self.reset_all();
                         }
                     } else {
                         let clear_btn = egui::Button::new(
