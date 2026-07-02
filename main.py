@@ -5,7 +5,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton,
                              QScrollArea, QFrame, QMessageBox, QFileDialog, QCheckBox,
                              QProgressBar, QSlider)
-from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtCore import Qt, QTimer, QUrl, QRegularExpression
+from PyQt6.QtGui import QScreen, QRegularExpressionValidator
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 CONFIG_FILE = 'config.ini'
@@ -177,7 +178,12 @@ class MainWindow(QMainWindow):
         self.is_paused = True
         self.config = configparser.ConfigParser()
         self.load_config()
-        
+
+        # Internal calculated values (not displayed in disabled fields)
+        self.calculated_interval = 0
+        self.calculated_count = 0
+        self.calculated_duration = 0
+
         self.init_ui()
         self.setup_sound()
         
@@ -205,7 +211,9 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Cascading Timers")
         self.setFixedWidth(400)
-        self.setMinimumHeight(600)
+        self.setMinimumHeight(400)
+        self.base_ui_height = 400  # Approximate height of UI without timers
+        self.timer_widget_height = 45  # Approximate height per timer widget
         
         # Spec Colors
         # Background: #010421, Accent: #fc035e
@@ -248,11 +256,16 @@ class MainWindow(QMainWindow):
         settings_frame = QFrame()
         settings_layout = QVBoxLayout(settings_frame)
         
+        # Time input validator - only allow digits, h, m, s, colons, spaces
+        self.time_validator = QRegularExpressionValidator(QRegularExpression(r"[0-9hmsHMS: ]*"))
+        self.time_placeholder = "e.g. 1h 30m, 0:10:00, 90s"
+
         # Interval
         h_interval = QHBoxLayout()
         h_interval.addWidget(QLabel("Interval:"))
         self.input_interval = QLineEdit()
-        self.input_interval.setPlaceholderText("HH:MM:SS")
+        self.input_interval.setValidator(self.time_validator)
+        self.input_interval.setPlaceholderText(self.time_placeholder)
         # Don't pre-fill - let user enter values
         self.input_interval.textChanged.connect(self.on_interval_changed)
         h_interval.addWidget(self.input_interval)
@@ -271,16 +284,18 @@ class MainWindow(QMainWindow):
         h_total = QHBoxLayout()
         h_total.addWidget(QLabel("Total Duration:"))
         self.input_duration = QLineEdit()
-        self.input_duration.setPlaceholderText("HH:MM:SS")
+        self.input_duration.setValidator(self.time_validator)
+        self.input_duration.setPlaceholderText(self.time_placeholder)
         self.input_duration.textChanged.connect(self.on_duration_changed)
         h_total.addWidget(self.input_duration)
         settings_layout.addLayout(h_total)
 
-        # Row 2.5: Offset
+        # Offset
         h_offset = QHBoxLayout()
         h_offset.addWidget(QLabel("Offset (First Timer):"))
         self.input_offset = QLineEdit()
-        self.input_offset.setPlaceholderText("HH:MM:SS")
+        self.input_offset.setValidator(self.time_validator)
+        self.input_offset.setPlaceholderText(self.time_placeholder)
         self.input_offset.textChanged.connect(self.on_offset_changed)
         h_offset.addWidget(self.input_offset)
         settings_layout.addLayout(h_offset)
@@ -461,6 +476,25 @@ class MainWindow(QMainWindow):
             self.player.stop()
         self.audio_timeout_timer.stop()
 
+    def adjust_window_size(self):
+        """Adjust window height based on number of timers, capped at screen height"""
+        screen = QApplication.primaryScreen()
+        if screen:
+            available_height = screen.availableGeometry().height()
+        else:
+            available_height = 800  # Fallback
+
+        # Calculate needed height
+        num_timers = len(self.timers)
+        needed_height = self.base_ui_height + (num_timers * self.timer_widget_height)
+
+        # Cap at screen height (with small margin)
+        max_height = available_height - 50
+        final_height = min(needed_height, max_height)
+        final_height = max(final_height, self.minimumHeight())  # Don't go below minimum
+
+        self.resize(self.width(), final_height)
+
     def on_timer_alert(self, timer_widget):
         # Called by TimerWidget when it STARTS alerting
         # Reset sound logic (restart sound if stopped, or refresh timeout)
@@ -534,6 +568,15 @@ class MainWindow(QMainWindow):
         self.update_field_states()
 
     def on_count_changed(self):
+        # Enforce max timer count of 20
+        try:
+            count_text = self.input_count.text().strip()
+            if count_text and int(count_text) > 20:
+                self.input_count.blockSignals(True)
+                self.input_count.setText("20")
+                self.input_count.blockSignals(False)
+        except ValueError:
+            pass
         self.update_field_states()
 
     def on_duration_changed(self):
@@ -561,13 +604,20 @@ class MainWindow(QMainWindow):
     def enable_field(self, field):
         field.setDisabled(False)
         field.setStyleSheet("background-color: #0d112b; color: white; border: 1px solid #fc035e; padding: 5px; border-radius: 3px;")
+        # Restore placeholder for time fields
+        if field in (self.input_interval, self.input_duration):
+            field.setPlaceholderText(self.time_placeholder)
 
     def disable_field(self, field):
         field.setDisabled(True)
+        field.blockSignals(True)
+        field.clear()  # Clear text - value is stored internally
+        field.setPlaceholderText("")  # Clear placeholder when disabled
+        field.blockSignals(False)
         field.setStyleSheet("background-color: #333; color: #555; border: 1px solid #555; padding: 5px; border-radius: 3px;")
 
     def calculate_interval(self):
-        """Calculate interval from count and duration"""
+        """Calculate interval from count and duration (store internally, don't display)"""
         try:
             count_text = self.input_count.text().strip()
             duration_text = self.input_duration.text().strip()
@@ -591,14 +641,12 @@ class MainWindow(QMainWindow):
                 interval = total_duration / count
 
             if interval > 0:
-                self.input_interval.blockSignals(True)
-                self.input_interval.setText(self.get_friendly_time(int(interval)))
-                self.input_interval.blockSignals(False)
+                self.calculated_interval = int(interval)
         except (ValueError, ZeroDivisionError, AttributeError):
             pass
 
     def calculate_count(self):
-        """Calculate count from interval and duration"""
+        """Calculate count from interval and duration (store internally, don't display)"""
         try:
             interval_text = self.input_interval.text().strip()
             duration_text = self.input_duration.text().strip()
@@ -626,14 +674,12 @@ class MainWindow(QMainWindow):
                 count = math.floor(total_duration / interval)
 
             if count > 0:
-                self.input_count.blockSignals(True)
-                self.input_count.setText(str(count))
-                self.input_count.blockSignals(False)
+                self.calculated_count = min(count, 20)  # Cap at 20
         except (ValueError, ZeroDivisionError, AttributeError):
             pass
 
     def calculate_duration(self):
-        """Calculate duration from interval and count"""
+        """Calculate duration from interval and count (store internally, don't display)"""
         try:
             interval_text = self.input_interval.text().strip()
             count_text = self.input_count.text().strip()
@@ -655,9 +701,7 @@ class MainWindow(QMainWindow):
             else:
                 total_duration = count * interval
 
-            self.input_duration.blockSignals(True)
-            self.input_duration.setText(self.get_friendly_time(int(total_duration)))
-            self.input_duration.blockSignals(False)
+            self.calculated_duration = int(total_duration)
         except (ValueError, AttributeError):
             pass
 
@@ -751,36 +795,22 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
         self.timers = []
 
-        # 2. Parse inputs
+        # 2. Parse inputs - use calculated values for disabled fields
         try:
-            interval_s = self.parse_time_str(self.input_interval.text())
+            # Get interval (from field or calculated)
+            if self.input_interval.isEnabled() and self.input_interval.text().strip():
+                interval_s = self.parse_time_str(self.input_interval.text())
+            else:
+                interval_s = self.calculated_interval
+
             if interval_s <= 0: return
 
+            # Get count (from field or calculated)
             count = 0
             if self.input_count.isEnabled() and self.input_count.text().strip():
                 count = int(self.input_count.text())
-            elif self.input_duration.isEnabled() and self.input_duration.text().strip():
-                total_s = self.parse_time_str(self.input_duration.text())
-                if total_s > 0:
-                    import math
-                    # If offset is present, calculation is tricky.
-                    # Total Duration implies last timer ends at Total Duration.
-                    # If offset present: T_last = offset + (count-1)*interval.
-                    # T_last <= total_s.
-                    # offset + (count-1)*interval <= total_s
-                    # (count-1)*interval <= total_s - offset
-                    # count-1 <= (total_s - offset) / interval
-                    # count <= ((total_s - offset) / interval) + 1
-                    
-                    offset_s = self.parse_time_str(self.input_offset.text())
-                    
-                    if offset_s > 0:
-                         if total_s < offset_s:
-                             count = 0
-                         else:
-                             count = math.floor(((total_s - offset_s) / interval_s)) + 1
-                    else:
-                        count = math.floor(total_s / interval_s)
+            elif not self.input_count.isEnabled():
+                count = self.calculated_count
 
             if count <= 0: return
             
@@ -812,8 +842,15 @@ class MainWindow(QMainWindow):
                     self.config['Settings']['timer_count'] = str(count)
                 self.save_config()
 
+            # Adjust window size for new timers
+            self.adjust_window_size()
+
         except ValueError:
             pass
+
+        # Also adjust if we cleared all timers
+        if not self.timers:
+            self.adjust_window_size()
 
     def start_all(self):
         if not self.timers:
@@ -850,6 +887,7 @@ class MainWindow(QMainWindow):
     def remove_timer_from_list(self, timer_widget):
         if timer_widget in self.timers:
             self.timers.remove(timer_widget)
+            self.adjust_window_size()
 
     def global_tick(self):
         # Check alerts logic
