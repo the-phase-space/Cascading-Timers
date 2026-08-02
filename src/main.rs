@@ -266,17 +266,23 @@ struct Timer {
     id: u64,
     total_seconds: f64,
     remaining_seconds: f64,
+    /// This timer's own inter-timer duration: how long after the previous
+    /// timer fires (or after Start All, for the first) this one fires. Stored
+    /// at creation because earlier timers are removed from the list once
+    /// silenced, so it can't be re-derived from neighbors later.
+    gap_seconds: f64,
     is_active: bool,
     is_alerting: bool,
     marked_for_removal: bool,
 }
 
 impl Timer {
-    fn new(id: u64, duration_seconds: f64) -> Self {
+    fn new(id: u64, duration_seconds: f64, gap_seconds: f64) -> Self {
         Self {
             id,
             total_seconds: duration_seconds,
             remaining_seconds: duration_seconds,
+            gap_seconds,
             is_active: false,
             is_alerting: false,
             marked_for_removal: false,
@@ -977,15 +983,16 @@ impl CascadingTimersApp {
                 cumulative += gap;
                 let id = self.next_timer_id;
                 self.next_timer_id += 1;
-                self.timers.push(Timer::new(id, cumulative));
+                self.timers.push(Timer::new(id, cumulative, gap));
             }
         } else {
             let start_base = if offset_s > 0.0 { offset_s } else { interval_s };
             for i in 0..count {
                 let duration = start_base + (i as f64) * interval_s;
+                let gap = if i == 0 { start_base } else { interval_s };
                 let id = self.next_timer_id;
                 self.next_timer_id += 1;
-                self.timers.push(Timer::new(id, duration));
+                self.timers.push(Timer::new(id, duration, gap));
             }
         }
 
@@ -1038,10 +1045,13 @@ impl CascadingTimersApp {
             }
         } else {
             self.timers.clear();
+            let mut prev = 0.0;
             for &dur in &self.completed_timer_durations {
+                let gap = (dur - prev).max(0.0);
+                prev = dur;
                 let id = self.next_timer_id;
                 self.next_timer_id += 1;
-                self.timers.push(Timer::new(id, dur));
+                self.timers.push(Timer::new(id, dur, gap));
             }
         }
         self.is_paused = true;
@@ -1722,25 +1732,13 @@ impl eframe::App for CascadingTimersApp {
                     .map(|t| t.id);
 
                 let pb_mode = self.progress_bar_mode;
-                // Per-timer gap: how long after the previous timer this one
-                // fires (= its geometric gap). Computed from cumulative fire times.
-                let gap_secs: Vec<f64> = self
+                // Per-timer gap label from the gap stored at creation (earlier
+                // timers may already be removed, so neighbors can't be trusted).
+                let gap_labels: Vec<String> = self
                     .timers
                     .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        let prev = if i == 0 {
-                            0.0
-                        } else {
-                            self.timers[i - 1].total_seconds
-                        };
-                        (t.total_seconds - prev).max(0.0)
-                    })
-                    .collect();
-                let gap_labels: Vec<String> = gap_secs
-                    .iter()
-                    .map(|&gap| {
-                        let secs = gap as u64;
+                    .map(|t| {
+                        let secs = t.gap_seconds as u64;
                         let h = secs / 3600;
                         let m = (secs % 3600) / 60;
                         let s = secs % 60;
@@ -1808,7 +1806,7 @@ impl eframe::App for CascadingTimersApp {
                                             1 => {
                                                 // Progress bar for next timer, normalized to
                                                 // its inter-timer gap so it starts full.
-                                                let gap = gap_secs[idx];
+                                                let gap = timer.gap_seconds;
                                                 let frac = if gap > 0.0 {
                                                     (timer.remaining_seconds / gap)
                                                         .clamp(0.0, 1.0)
