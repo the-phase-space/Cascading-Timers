@@ -318,13 +318,6 @@ impl Timer {
         }
     }
 
-    fn fraction_remaining(&self) -> f32 {
-        if self.total_seconds > 0.0 {
-            (self.remaining_seconds / self.total_seconds) as f32
-        } else {
-            0.0
-        }
-    }
 }
 
 // ─── Time parsing ────────────────────────────────────────────────────────────
@@ -1729,9 +1722,9 @@ impl eframe::App for CascadingTimersApp {
                     .map(|t| t.id);
 
                 let pb_mode = self.progress_bar_mode;
-                // Per-timer gap label: how long after the previous timer this one
+                // Per-timer gap: how long after the previous timer this one
                 // fires (= its geometric gap). Computed from cumulative fire times.
-                let gap_labels: Vec<String> = self
+                let gap_secs: Vec<f64> = self
                     .timers
                     .iter()
                     .enumerate()
@@ -1741,7 +1734,13 @@ impl eframe::App for CascadingTimersApp {
                         } else {
                             self.timers[i - 1].total_seconds
                         };
-                        let secs = (t.total_seconds - prev).max(0.0) as u64;
+                        (t.total_seconds - prev).max(0.0)
+                    })
+                    .collect();
+                let gap_labels: Vec<String> = gap_secs
+                    .iter()
+                    .map(|&gap| {
+                        let secs = gap as u64;
                         let h = secs / 3600;
                         let m = (secs % 3600) / 60;
                         let s = secs % 60;
@@ -1807,11 +1806,18 @@ impl eframe::App for CascadingTimersApp {
 
                                         match display_mode {
                                             1 => {
-                                                // Progress bar for next timer
-                                                let pbar = egui::ProgressBar::new(
-                                                    timer.fraction_remaining(),
-                                                )
-                                                .fill(ACCENT);
+                                                // Progress bar for next timer, normalized to
+                                                // its inter-timer gap so it starts full.
+                                                let gap = gap_secs[idx];
+                                                let frac = if gap > 0.0 {
+                                                    (timer.remaining_seconds / gap)
+                                                        .clamp(0.0, 1.0)
+                                                        as f32
+                                                } else {
+                                                    0.0
+                                                };
+                                                let pbar =
+                                                    egui::ProgressBar::new(frac).fill(ACCENT);
                                                 ui.add_sized([content_width, 20.0], pbar);
                                             }
                                             2 => {
