@@ -1,7 +1,7 @@
 # Normalize line endings across machines.
 # Text files are stored as LF in the repo and checked out as LF,
 # overriding any local core.autocrlf=true.
-* text=auto eol=lf
+* text=auto eol=crlf
 
 # Explicitly mark common binary types so they are never normalized.
 *.png  binary
