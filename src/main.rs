@@ -1871,7 +1871,7 @@ impl eframe::App for CascadingTimersApp {
                                     // a touch. Typed digits keep the stock position.
                                     if sigma_enabled && self.input_sigma.is_empty() {
                                         ui.painter().text(
-                                            r.rect.center() - egui::vec2(0.0, 1.5),
+                                            r.rect.center() - egui::vec2(0.0, 2.0),
                                             egui::Align2::CENTER_CENTER,
                                             "σ",
                                             egui::FontId::proportional(13.5),
