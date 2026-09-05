@@ -37,6 +37,8 @@ struct Config {
     geometric_enabled: bool,
     geometric_ratio: String,
     randomize_enabled: bool,
+    randomize_gaussian: bool,
+    randomize_sigma: String,
 }
 
 impl Config {
@@ -63,6 +65,11 @@ impl Config {
                         .get("Settings", "randomize_enabled")
                         .unwrap_or_default()
                         .eq_ignore_ascii_case("true"),
+                    randomize_gaussian: conf
+                        .get("Settings", "randomize_gaussian")
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case("true"),
+                    randomize_sigma: conf.get("Settings", "randomize_sigma").unwrap_or_default(),
                 };
             }
         }
@@ -91,6 +98,12 @@ impl Config {
             "randomize_enabled",
             Some(if self.randomize_enabled { "True" } else { "False" }.to_string()),
         );
+        conf.set(
+            "Settings",
+            "randomize_gaussian",
+            Some(if self.randomize_gaussian { "True" } else { "False" }.to_string()),
+        );
+        conf.set("Settings", "randomize_sigma", Some(self.randomize_sigma.clone()));
         let _ = conf.write(config_path().to_string_lossy().as_ref());
     }
 }
@@ -106,6 +119,8 @@ impl Default for Config {
             geometric_enabled: false,
             geometric_ratio: String::new(),
             randomize_enabled: false,
+            randomize_gaussian: false,
+            randomize_sigma: String::new(),
         }
     }
 }
@@ -384,6 +399,96 @@ fn parse_time_str(s: &str) -> f64 {
     total
 }
 
+/// Unit the σ field inherits from the Total Duration text: the last h/m/s
+/// suffix present wins; a bare number or H:MM:SS falls back to minutes, the
+/// parser's own default for raw numbers. Returns (seconds per unit, name).
+fn duration_unit(duration_text: &str) -> (f64, &'static str) {
+    let s = duration_text.trim().to_lowercase();
+    let mut unit = (60.0, "minutes");
+    if s.contains(':') {
+        return unit;
+    }
+    for part in s.split_whitespace() {
+        if part.ends_with('h') {
+            unit = (3600.0, "hours");
+        } else if part.ends_with('m') {
+            unit = (60.0, "minutes");
+        } else if part.ends_with('s') {
+            unit = (1.0, "seconds");
+        }
+    }
+    unit
+}
+
+/// Restrict the σ buffer to digits and a decimal point — no letters, since the
+/// unit is inherited from Total Duration rather than typed.
+fn sanitize_sigma(s: &mut String) {
+    s.retain(|c| c.is_ascii_digit() || c == '.');
+}
+
+/// One standard-normal draw via Box–Muller.
+fn sample_standard_normal<R: Rng>(rng: &mut R) -> f64 {
+    let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+    let u2: f64 = rng.random::<f64>();
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
+/// Position curve for the distribution switch: a logistic sigmoid rescaled so
+/// it hits exactly 0 at t=0 and 1 at t=1, which makes the knob's velocity
+/// profile the sigmoid's bell-shaped first derivative.
+fn sigmoid_ease(t: f32) -> f32 {
+    const K: f32 = 10.0;
+    let logistic = |x: f32| 1.0 / (1.0 + (-K * (x - 0.5)).exp());
+    let lo = logistic(0.0);
+    let hi = logistic(1.0);
+    ((logistic(t.clamp(0.0, 1.0)) - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+const SWITCH_ANIM_SECS: f32 = 0.25;
+
+/// Sliding two-state switch. Left (false) / right (true). The knob glides
+/// between the two ends over SWITCH_ANIM_SECS following `sigmoid_ease`.
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool, enabled: bool) -> egui::Response {
+    let size = egui::vec2(34.0, 18.0);
+    let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if !enabled {
+        response = response.on_disabled_hover_text("");
+    }
+    if enabled && response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let linear = ui
+        .ctx()
+        .animate_bool_with_time(response.id, *on, SWITCH_ANIM_SECS);
+    let t = sigmoid_ease(linear);
+
+    if ui.is_rect_visible(rect) {
+        let radius = rect.height() / 2.0;
+        let (track_stroke, knob_fill) = if !enabled {
+            (DISABLED_BORDER, DISABLED_BORDER)
+        } else if response.hovered() {
+            (ACCENT_HOVER, ACCENT_HOVER)
+        } else {
+            (ACCENT, ACCENT)
+        };
+        ui.painter().rect(
+            rect,
+            radius,
+            BG_WIDGET,
+            egui::Stroke::new(1.0, track_stroke),
+            egui::StrokeKind::Inside,
+        );
+        let knob_r = radius - 3.0;
+        let x_left = rect.left() + radius;
+        let x_right = rect.right() - radius;
+        let x = egui::lerp(x_left..=x_right, t);
+        ui.painter()
+            .circle_filled(egui::pos2(x, rect.center().y), knob_r, knob_fill);
+    }
+    response
+}
+
 // ─── Field state tracking ────────────────────────────────────────────────────
 #[derive(PartialEq, Clone, Copy)]
 enum DisabledField {
@@ -458,6 +563,11 @@ struct CascadingTimersApp {
     // Randomized intervals: schedule is drawn from Count + Duration (+ Offset)
     // alone; Interval and Geometric Series are greyed out while this is on.
     randomize_enabled: bool,
+    // Distribution switch: false = uniform fire times, true = gaussian gaps
+    // around the evenly-spaced mean with user-supplied σ (units follow Total
+    // Duration).
+    randomize_gaussian: bool,
+    input_sigma: String,
 
     // Speed
     speed_pct: u32, // 50..=200, representing 0.50x to 2.00x
@@ -609,6 +719,8 @@ impl CascadingTimersApp {
             geom_invalid: false,
 
             randomize_enabled: config.randomize_enabled,
+            randomize_gaussian: config.randomize_gaussian,
+            input_sigma: config.randomize_sigma.clone(),
 
             speed_pct: 100,
 
@@ -1024,16 +1136,54 @@ impl CascadingTimersApp {
                 return;
             }
             let mut rng = rand::rng();
-            let mut samples: Vec<f64> = (0..n_random).map(|_| rng.random::<f64>()).collect();
-            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let max = samples.last().copied().unwrap_or(0.0);
-            let scale = if max > 0.0 { span / max } else { 0.0 };
-
             let mut fire_times: Vec<f64> = Vec::with_capacity(count as usize);
             if offset_s > 0.0 {
                 fire_times.push(offset_s);
             }
-            fire_times.extend(samples.iter().map(|u| base + u * scale));
+            if self.randomize_gaussian {
+                // Gaussian gaps: µ is pinned to the evenly-spaced interval that
+                // the other inputs imply (span / n), σ comes from the user in
+                // Total Duration's units. Draws are clamped at zero, then the
+                // whole set is rescaled so the gaps sum exactly to `span` —
+                // which also keeps their mean exactly at µ.
+                if n_random > 0 {
+                    let mu = span / n_random as f64;
+                    let (unit_secs, _) = duration_unit(&self.input_duration);
+                    let sigma = self.input_sigma.trim().parse::<f64>().unwrap_or(0.0)
+                        .max(0.0)
+                        * unit_secs;
+                    let mut gaps: Vec<f64> = (0..n_random)
+                        .map(|_| (mu + sigma * sample_standard_normal(&mut rng)).max(0.0))
+                        .collect();
+                    let total: f64 = gaps.iter().sum();
+                    if total > 0.0 {
+                        let scale = span / total;
+                        for g in &mut gaps {
+                            *g *= scale;
+                        }
+                    } else {
+                        for g in &mut gaps {
+                            *g = mu;
+                        }
+                    }
+                    let mut acc = base;
+                    for g in gaps {
+                        acc += g;
+                        fire_times.push(acc);
+                    }
+                    // Absorb accumulated rounding so the last timer lands on Duration.
+                    if let Some(last) = fire_times.last_mut() {
+                        *last = duration_s;
+                    }
+                }
+            } else {
+                let mut samples: Vec<f64> =
+                    (0..n_random).map(|_| rng.random::<f64>()).collect();
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let max = samples.last().copied().unwrap_or(0.0);
+                let scale = if max > 0.0 { span / max } else { 0.0 };
+                fire_times.extend(samples.iter().map(|u| base + u * scale));
+            }
 
             let mut prev = 0.0;
             for fire in fire_times {
@@ -1050,6 +1200,7 @@ impl CascadingTimersApp {
             self.config.timer_count = format!("{count}");
             self.config.geometric_enabled = false;
             self.config.randomize_enabled = true;
+            self.config.randomize_sigma = self.input_sigma.clone();
             self.config.save();
             return;
         }
@@ -1171,15 +1322,18 @@ impl CascadingTimersApp {
         self.input_duration.clear();
         self.input_offset.clear();
         self.input_ratio.clear();
+        self.input_sigma.clear();
         self.geom_invalid = false;
         self.geometric_enabled = false;
         self.randomize_enabled = false;
         self.speed_pct = 100; // reset to 1.00x
         self.disabled_field = DisabledField::None;
         // Persist the reset mode flags so they don't silently reappear on relaunch.
+        // The uniform/gaussian switch is a preference and survives a clear.
         self.config.geometric_enabled = false;
         self.config.geometric_ratio = String::new();
         self.config.randomize_enabled = false;
+        self.config.randomize_sigma = String::new();
         self.config.save();
     }
 
@@ -1597,6 +1751,9 @@ impl eframe::App for CascadingTimersApp {
                     let left_w = (ui.available_width() - button_area - sp).max(140.0);
 
                     let mut geo_changed = false;
+                    // Left edge of the Randomize Intervals checkbox, captured in
+                    // row 1 so the distribution switch in row 2 sits beneath it.
+                    let mut rand_x: Option<f32> = None;
 
                     ui.vertical(|ui| {
                         ui.set_width(left_w);
@@ -1683,9 +1840,37 @@ impl eframe::App for CascadingTimersApp {
                                     ),
                                 );
                                 ui.spacing_mut().button_padding = old_pad;
+                                rand_x = Some(cb.rect.min.x);
                                 if cb.changed() {
                                     self.set_randomize(rnd);
                                     geo_changed = true;
+                                }
+
+                                // σ entry — only exists while the switch is on
+                                // "gaussian". Digits and '.' only; the unit is
+                                // whatever Total Duration is expressed in.
+                                if self.randomize_gaussian {
+                                    let sigma_enabled = !cohort_live;
+                                    let sigma_color =
+                                        if sigma_enabled { TEXT_WHITE } else { DISABLED_BORDER };
+                                    let te = egui::TextEdit::singleline(&mut self.input_sigma)
+                                        .hint_text(if sigma_enabled { "σ" } else { "" })
+                                        .text_color(sigma_color)
+                                        .horizontal_align(egui::Align::Center)
+                                        .interactive(sigma_enabled);
+                                    let r = ui.add_sized([56.0, row_h - 2.0], te);
+                                    let (_, unit_name) = duration_unit(&self.input_duration);
+                                    let r = r.on_hover_text(format!(
+                                        "Std. deviation of each gap, in {unit_name} \
+                                         (inherited from Total Duration). \
+                                         The mean is fixed at the evenly-spaced interval."
+                                    ));
+                                    if r.changed() {
+                                        sanitize_sigma(&mut self.input_sigma);
+                                        if self.randomize_enabled {
+                                            geo_changed = true;
+                                        }
+                                    }
                                 }
                             },
                         );
@@ -1709,6 +1894,34 @@ impl eframe::App for CascadingTimersApp {
                                     self.progress_bar_mode = pb;
                                     self.config.progress_bar_mode = pb;
                                     self.config.save();
+                                }
+
+                                // Distribution switch: uniform ⇄ gaussian, aligned
+                                // under the Randomize Intervals checkbox above.
+                                if let Some(x) = rand_x {
+                                    let pad = x - ui.cursor().min.x - ui.spacing().item_spacing.x;
+                                    if pad > 0.0 {
+                                        ui.add_space(pad);
+                                    }
+                                }
+                                let switch_enabled = !cohort_live;
+                                let label_color =
+                                    if switch_enabled { TEXT_WHITE } else { TEXT_DIM };
+                                ui.label(
+                                    egui::RichText::new("uniform").color(label_color).size(8.5),
+                                );
+                                let mut gaussian = self.randomize_gaussian;
+                                let sw = toggle_switch(ui, &mut gaussian, switch_enabled);
+                                ui.label(
+                                    egui::RichText::new("gaussian").color(label_color).size(8.5),
+                                );
+                                if sw.changed() {
+                                    self.randomize_gaussian = gaussian;
+                                    self.config.randomize_gaussian = gaussian;
+                                    self.config.save();
+                                    if self.randomize_enabled {
+                                        geo_changed = true;
+                                    }
                                 }
                             },
                         );
