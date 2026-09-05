@@ -609,6 +609,9 @@ struct CascadingTimersApp {
     completed_timer_durations: Vec<f64>,
 }
 
+/// Upper bound on timers per cohort; typed counts clamp to it.
+const MAX_COUNT: u32 = 25;
+
 const FONT_BOLD: &str = "app-bold";
 const FONT_TIMER: &str = "app-timer";
 
@@ -1062,7 +1065,7 @@ impl CascadingTimersApp {
             (total_duration / interval).floor()
         };
         if count > 0.0 {
-            self.calculated_count = (count as u32).min(20);
+            self.calculated_count = (count as u32).min(MAX_COUNT);
         }
     }
 
@@ -1112,7 +1115,7 @@ impl CascadingTimersApp {
 
         self.timers.clear();
 
-        let count = self.get_effective_count().min(20);
+        let count = self.get_effective_count().min(MAX_COUNT);
         if count == 0 {
             return;
         }
@@ -1668,8 +1671,8 @@ impl eframe::App for CascadingTimersApp {
                         if r.changed() {
                             self.input_count.retain(|c| c.is_ascii_digit());
                             if let Ok(v) = self.input_count.trim().parse::<u32>() {
-                                if v > 20 {
-                                    self.input_count = "20".to_string();
+                                if v > MAX_COUNT {
+                                    self.input_count = MAX_COUNT.to_string();
                                 }
                             }
                             fields_changed = true;
