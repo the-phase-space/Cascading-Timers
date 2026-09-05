@@ -1855,8 +1855,13 @@ impl eframe::App for CascadingTimersApp {
                                     let sigma_enabled = !cohort_live;
                                     let sigma_color =
                                         if sigma_enabled { TEXT_WHITE } else { DISABLED_BORDER };
+                                    // σ glyph reads small at the default 12.5 body
+                                    // size, so the hint alone is bumped one point.
                                     let te = egui::TextEdit::singleline(&mut self.input_sigma)
-                                        .hint_text(if sigma_enabled { "σ" } else { "" })
+                                        .hint_text(
+                                            egui::RichText::new(if sigma_enabled { "σ" } else { "" })
+                                                .size(13.5),
+                                        )
                                         .text_color(sigma_color)
                                         .horizontal_align(egui::Align::Center)
                                         .interactive(sigma_enabled);
