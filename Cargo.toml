@@ -11,6 +11,7 @@ rodio = "0.20"
 rfd = "0.15"
 configparser = "3"
 image = "0.25"
+rand = "0.9"
 
 [profile.release]
 opt-level = 2

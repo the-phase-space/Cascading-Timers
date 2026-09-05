@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
+use rand::Rng;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,7 @@ struct Config {
     progress_bar_mode: bool,
     geometric_enabled: bool,
     geometric_ratio: String,
+    randomize_enabled: bool,
 }
 
 impl Config {
@@ -57,6 +59,10 @@ impl Config {
                         .unwrap_or_default()
                         .eq_ignore_ascii_case("true"),
                     geometric_ratio: conf.get("Settings", "geometric_ratio").unwrap_or_default(),
+                    randomize_enabled: conf
+                        .get("Settings", "randomize_enabled")
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case("true"),
                 };
             }
         }
@@ -80,6 +86,11 @@ impl Config {
             Some(if self.geometric_enabled { "True" } else { "False" }.to_string()),
         );
         conf.set("Settings", "geometric_ratio", Some(self.geometric_ratio.clone()));
+        conf.set(
+            "Settings",
+            "randomize_enabled",
+            Some(if self.randomize_enabled { "True" } else { "False" }.to_string()),
+        );
         let _ = conf.write(config_path().to_string_lossy().as_ref());
     }
 }
@@ -94,6 +105,7 @@ impl Default for Config {
             progress_bar_mode: false,
             geometric_enabled: false,
             geometric_ratio: String::new(),
+            randomize_enabled: false,
         }
     }
 }
@@ -443,6 +455,10 @@ struct CascadingTimersApp {
     geometric_enabled: bool,
     geom_invalid: bool, // a geometric solve had no valid solution
 
+    // Randomized intervals: schedule is drawn from Count + Duration (+ Offset)
+    // alone; Interval and Geometric Series are greyed out while this is on.
+    randomize_enabled: bool,
+
     // Speed
     speed_pct: u32, // 50..=200, representing 0.50x to 2.00x
 
@@ -589,8 +605,10 @@ impl CascadingTimersApp {
 
             disabled_field: DisabledField::None,
 
-            geometric_enabled: config.geometric_enabled,
+            geometric_enabled: config.geometric_enabled && !config.randomize_enabled,
             geom_invalid: false,
+
+            randomize_enabled: config.randomize_enabled,
 
             speed_pct: 100,
 
@@ -645,7 +663,9 @@ impl CascadingTimersApp {
     }
 
     fn update_field_states(&mut self) {
-        if self.geometric_enabled {
+        if self.randomize_enabled {
+            self.update_field_states_random();
+        } else if self.geometric_enabled {
             self.update_field_states_geometric();
         } else {
             // Leaving geometric: release a ratio-computed lock if one is held.
@@ -687,6 +707,32 @@ impl CascadingTimersApp {
             DisabledField::Ratio => self.input_ratio = format!("{:.4}", self.calculated_ratio),
             DisabledField::None => {}
         }
+    }
+
+    /// Randomized intervals: Count and Duration are both plain inputs (no
+    /// two-of-three solve) and Interval is greyed out. A cohort is drawn as
+    /// soon as both are valid.
+    fn update_field_states_random(&mut self) {
+        self.set_disabled_field(DisabledField::None);
+        self.geom_invalid = false;
+        if Self::is_valid_count(&self.input_count) && Self::is_valid_time(&self.input_duration) {
+            self.needs_rebuild = true;
+        }
+    }
+
+    /// Toggle randomized intervals. Turning it on greys Interval and Geometric
+    /// Series, so their inputs are dropped and geometric mode is switched off.
+    fn set_randomize(&mut self, on: bool) {
+        self.randomize_enabled = on;
+        if on {
+            self.set_disabled_field(DisabledField::None);
+            self.input_interval.clear();
+            self.geometric_enabled = false;
+            self.geom_invalid = false;
+            self.config.geometric_enabled = false;
+        }
+        self.config.randomize_enabled = on;
+        self.config.save();
     }
 
     /// Normal (arithmetic) two-of-three among Interval / Count / Duration.
@@ -957,12 +1003,61 @@ impl CascadingTimersApp {
             return;
         }
 
+        let offset_s = parse_time_str(&self.input_offset);
+
+        if self.randomize_enabled {
+            // Random schedule: draw `count` uniform samples on [0, 1) (or
+            // `count - 1` when an offset claims the first slot), sort them, and
+            // scale so the largest lands exactly on Total Duration. With an
+            // offset the samples span [offset, Duration] instead, so the first
+            // timer still fires at the offset as in the other modes.
+            let duration_s = parse_time_str(&self.input_duration);
+            if duration_s <= 0.0 {
+                return;
+            }
+            let (base, span, n_random) = if offset_s > 0.0 {
+                (offset_s, duration_s - offset_s, count - 1)
+            } else {
+                (0.0, duration_s, count)
+            };
+            if n_random > 0 && span <= 0.0 {
+                return;
+            }
+            let mut rng = rand::rng();
+            let mut samples: Vec<f64> = (0..n_random).map(|_| rng.random::<f64>()).collect();
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let max = samples.last().copied().unwrap_or(0.0);
+            let scale = if max > 0.0 { span / max } else { 0.0 };
+
+            let mut fire_times: Vec<f64> = Vec::with_capacity(count as usize);
+            if offset_s > 0.0 {
+                fire_times.push(offset_s);
+            }
+            fire_times.extend(samples.iter().map(|u| base + u * scale));
+
+            let mut prev = 0.0;
+            for fire in fire_times {
+                let gap = (fire - prev).max(0.0);
+                prev = fire;
+                let id = self.next_timer_id;
+                self.next_timer_id += 1;
+                self.timers.push(Timer::new(id, fire, gap));
+            }
+
+            self.completed_timer_durations =
+                self.timers.iter().map(|t| t.total_seconds).collect();
+
+            self.config.timer_count = format!("{count}");
+            self.config.geometric_enabled = false;
+            self.config.randomize_enabled = true;
+            self.config.save();
+            return;
+        }
+
         let interval_s = self.get_effective_interval();
         if interval_s <= 0.0 {
             return;
         }
-
-        let offset_s = parse_time_str(&self.input_offset);
 
         if self.geometric_enabled {
             let r = self.get_effective_ratio();
@@ -1078,11 +1173,13 @@ impl CascadingTimersApp {
         self.input_ratio.clear();
         self.geom_invalid = false;
         self.geometric_enabled = false;
+        self.randomize_enabled = false;
         self.speed_pct = 100; // reset to 1.00x
         self.disabled_field = DisabledField::None;
         // Persist the reset mode flags so they don't silently reappear on relaunch.
         self.config.geometric_enabled = false;
         self.config.geometric_ratio = String::new();
+        self.config.randomize_enabled = false;
         self.config.save();
     }
 
@@ -1391,8 +1488,9 @@ impl eframe::App for CascadingTimersApp {
                         ui.label(
                             egui::RichText::new("Interval:").color(TEXT_WHITE).size(14.0),
                         );
-                        let enabled =
-                            !self.timers_running && self.disabled_field != DisabledField::Interval;
+                        let enabled = !self.timers_running
+                            && !self.randomize_enabled
+                            && self.disabled_field != DisabledField::Interval;
                         let te = styled_text_edit(&mut self.input_interval, placeholder, enabled);
                         let r = ui.add_sized([ui.available_width(), 24.0], te);
                         if r.changed() {
@@ -1510,13 +1608,15 @@ impl eframe::App for CascadingTimersApp {
                             |ui| {
                                 let old_pad = ui.spacing().button_padding;
                                 ui.spacing_mut().button_padding.y = 3.5;
+                                let randomized = self.randomize_enabled;
+                                let geo_enabled = !cohort_live && !randomized;
                                 let mut geo = self.geometric_enabled;
                                 let cb = ui.add_enabled(
-                                    !cohort_live,
+                                    geo_enabled,
                                     egui::Checkbox::new(
                                         &mut geo,
                                         egui::RichText::new("Geometric Series")
-                                            .color(if cohort_live { TEXT_DIM } else { TEXT_WHITE })
+                                            .color(if geo_enabled { TEXT_WHITE } else { TEXT_DIM })
                                             .size(12.0),
                                     ),
                                 );
@@ -1530,10 +1630,10 @@ impl eframe::App for CascadingTimersApp {
 
                                 // Ratio entry box (fits "1.0000"). Freely editable
                                 // from a fresh state — no need to check the box first;
-                                // it only greys/locks once a cohort is live or it
-                                // becomes the auto-computed field.
+                                // it only greys/locks once a cohort is live, intervals
+                                // are randomized, or it becomes the auto-computed field.
                                 let ratio_computed = self.disabled_field == DisabledField::Ratio;
-                                let ratio_enabled = !cohort_live && !ratio_computed;
+                                let ratio_enabled = !cohort_live && !randomized && !ratio_computed;
                                 let ratio_color =
                                     if ratio_enabled { TEXT_WHITE } else { DISABLED_BORDER };
                                 let te = egui::TextEdit::singleline(&mut self.input_ratio)
@@ -1562,6 +1662,30 @@ impl eframe::App for CascadingTimersApp {
                                         "No geometric series fits those values \
                                          (Total Duration must exceed the base Interval).",
                                     );
+                                }
+
+                                // Randomize Intervals checkbox. Only checkable from
+                                // the blank/cleared state: once a non-random cohort
+                                // exists it greys out until Clear All. It stays live
+                                // while a random cohort exists so it can be unchecked.
+                                let rand_enabled =
+                                    !cohort_live && (self.timers.is_empty() || randomized);
+                                let old_pad = ui.spacing().button_padding;
+                                ui.spacing_mut().button_padding.y = 3.5;
+                                let mut rnd = self.randomize_enabled;
+                                let cb = ui.add_enabled(
+                                    rand_enabled,
+                                    egui::Checkbox::new(
+                                        &mut rnd,
+                                        egui::RichText::new("Randomize Intervals")
+                                            .color(if rand_enabled { TEXT_WHITE } else { TEXT_DIM })
+                                            .size(12.0),
+                                    ),
+                                );
+                                ui.spacing_mut().button_padding = old_pad;
+                                if cb.changed() {
+                                    self.set_randomize(rnd);
+                                    geo_changed = true;
                                 }
                             },
                         );

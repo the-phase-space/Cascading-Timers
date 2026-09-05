@@ -804,6 +804,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "image",
+ "rand 0.9.2",
  "rfd",
  "rodio",
  "winresource",
