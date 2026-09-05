@@ -14,10 +14,10 @@ const TEXT_WHITE: egui::Color32 = egui::Color32::WHITE;
 const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(0xAA, 0xAA, 0xAA);
 const DISABLED_BORDER: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
 const CLEAR_RED: egui::Color32 = egui::Color32::from_rgb(0xAB, 0x00, 0x00);
-/// Margin for the small ratio/σ entry boxes. egui's stock symmetric(4, 2)
-/// centers the full line box, which leaves digits (no descender) riding
-/// visibly high; moving the 2pt of vertical slack to the top settles them.
-const SMALL_BOX_MARGIN: egui::Margin = egui::Margin { left: 4, right: 4, top: 4, bottom: 0 };
+/// Margin for every text entry box. egui's stock symmetric(4, 2) centers
+/// the full line box, which leaves the text riding visibly high; moving
+/// the 2pt of vertical slack to the top settles it between the borders.
+const INPUT_MARGIN: egui::Margin = egui::Margin { left: 4, right: 4, top: 4, bottom: 0 };
 const BTN_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
 const RESET_GREEN: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x8A, 0x2A);
 const ERR_RED: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x55, 0x55);
@@ -1543,6 +1543,7 @@ fn styled_text_edit<'a>(text: &'a mut String, hint: &'a str, enabled: bool) -> e
     egui::TextEdit::singleline(text)
         .hint_text(if enabled { hint } else { "" })
         .text_color(if enabled { TEXT_WHITE } else { DISABLED_BORDER })
+        .margin(INPUT_MARGIN)
         .interactive(enabled)
 }
 
@@ -1805,12 +1806,25 @@ impl eframe::App for CascadingTimersApp {
                                 let ratio_color =
                                     if ratio_enabled { TEXT_WHITE } else { DISABLED_BORDER };
                                 let te = egui::TextEdit::singleline(&mut self.input_ratio)
-                                    .hint_text(if ratio_enabled { "ratio" } else { "" })
                                     .text_color(ratio_color)
                                     .horizontal_align(egui::Align::Center)
-                                    .margin(SMALL_BOX_MARGIN)
+                                    .margin(INPUT_MARGIN)
                                     .interactive(ratio_enabled);
                                 let r = ui.add_sized([56.0, row_h - 2.0], te);
+                                // Hint painted by hand so it can sit independently
+                                // of the typed digits: INPUT_MARGIN drops the
+                                // inner rect 2pt to settle digits, but the hint
+                                // looked right at the stock position, so it's
+                                // raised back by the same amount.
+                                if ratio_enabled && self.input_ratio.is_empty() {
+                                    ui.painter().text(
+                                        r.rect.center() - egui::vec2(0.0, 2.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        "ratio",
+                                        egui::TextStyle::Body.resolve(ui.style()),
+                                        ui.visuals().weak_text_color(),
+                                    );
+                                }
                                 if r.changed() {
                                     sanitize_ratio(&mut self.input_ratio);
                                     // Only the cascade calc cares about the ratio, so
@@ -1871,7 +1885,7 @@ impl eframe::App for CascadingTimersApp {
                                     let te = egui::TextEdit::singleline(&mut self.input_sigma)
                                         .text_color(sigma_color)
                                         .horizontal_align(egui::Align::Center)
-                                        .margin(SMALL_BOX_MARGIN)
+                                        .margin(INPUT_MARGIN)
                                         .interactive(sigma_enabled);
                                     let r = ui.add_sized([56.0, row_h - 2.0], te);
                                     // The σ hint is painted by hand rather than via
@@ -1879,10 +1893,12 @@ impl eframe::App for CascadingTimersApp {
                                     // body size (so it's bumped one point), and
                                     // having no ascender its visual mass sits below
                                     // "ratio" in the sibling box, so it's nudged up
-                                    // a touch. Typed digits keep the stock position.
+                                    // 2pt relative to the ratio hint (plus the 2pt
+                                    // that cancels INPUT_MARGIN's drop, as for
+                                    // "ratio"). Typed digits keep the margin position.
                                     if sigma_enabled && self.input_sigma.is_empty() {
                                         ui.painter().text(
-                                            r.rect.center() - egui::vec2(0.0, 2.0),
+                                            r.rect.center() - egui::vec2(0.0, 4.0),
                                             egui::Align2::CENTER_CENTER,
                                             "σ",
                                             egui::FontId::proportional(13.5),
@@ -2045,6 +2061,9 @@ impl eframe::App for CascadingTimersApp {
                                 .size(14.0),
                         )
                         .fill(CLEAR_RED)
+                        // The theme's pink widget stroke vanishes on the pink
+                        // accent buttons but clashes here, so match it to the fill.
+                        .stroke(egui::Stroke::new(1.0, CLEAR_RED))
                         .corner_radius(4.0)
                         .min_size(egui::vec2(btn_width, 30.0));
                         if ui.add(clear_btn).clicked() {
