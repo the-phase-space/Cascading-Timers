@@ -437,7 +437,9 @@ fn sample_standard_normal<R: Rng>(rng: &mut R) -> f64 {
 /// it hits exactly 0 at t=0 and 1 at t=1, which makes the knob's velocity
 /// profile the sigmoid's bell-shaped first derivative.
 fn sigmoid_ease(t: f32) -> f32 {
-    const K: f32 = 10.0;
+    // Steepness: at 16 the middle fifth of the animation covers ~2/3 of the
+    // travel, so the knob visibly lingers at the ends and snaps through the middle.
+    const K: f32 = 16.0;
     let logistic = |x: f32| 1.0 / (1.0 + (-K * (x - 0.5)).exp());
     let lo = logistic(0.0);
     let hi = logistic(1.0);
