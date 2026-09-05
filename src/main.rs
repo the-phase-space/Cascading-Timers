@@ -14,6 +14,10 @@ const TEXT_WHITE: egui::Color32 = egui::Color32::WHITE;
 const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(0xAA, 0xAA, 0xAA);
 const DISABLED_BORDER: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
 const CLEAR_RED: egui::Color32 = egui::Color32::from_rgb(0xAB, 0x00, 0x00);
+/// Margin for the small ratio/σ entry boxes. egui's stock symmetric(4, 2)
+/// centers the full line box, which leaves digits (no descender) riding
+/// visibly high; moving the 2pt of vertical slack to the top settles them.
+const SMALL_BOX_MARGIN: egui::Margin = egui::Margin { left: 4, right: 4, top: 4, bottom: 0 };
 const BTN_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
 const RESET_GREEN: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x8A, 0x2A);
 const ERR_RED: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x55, 0x55);
@@ -450,8 +454,10 @@ const SWITCH_ANIM_SECS: f32 = 0.25;
 
 /// Sliding two-state switch. Left (false) / right (true). The knob glides
 /// between the two ends over SWITCH_ANIM_SECS following `sigmoid_ease`.
+const TOGGLE_SWITCH_SIZE: egui::Vec2 = egui::vec2(34.0, 18.0);
+
 fn toggle_switch(ui: &mut egui::Ui, on: &mut bool, enabled: bool) -> egui::Response {
-    let size = egui::vec2(34.0, 18.0);
+    let size = TOGGLE_SWITCH_SIZE;
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
     if !enabled {
         response = response.on_disabled_hover_text("");
@@ -1758,7 +1764,7 @@ impl eframe::App for CascadingTimersApp {
                     let mut geo_changed = false;
                     // Left edge of the Randomize Intervals checkbox, captured in
                     // row 1 so the distribution switch in row 2 sits beneath it.
-                    let mut rand_x: Option<f32> = None;
+                    let mut rand_span: Option<(f32, f32)> = None;
 
                     ui.vertical(|ui| {
                         ui.set_width(left_w);
@@ -1802,6 +1808,7 @@ impl eframe::App for CascadingTimersApp {
                                     .hint_text(if ratio_enabled { "ratio" } else { "" })
                                     .text_color(ratio_color)
                                     .horizontal_align(egui::Align::Center)
+                                    .margin(SMALL_BOX_MARGIN)
                                     .interactive(ratio_enabled);
                                 let r = ui.add_sized([56.0, row_h - 2.0], te);
                                 if r.changed() {
@@ -1845,7 +1852,10 @@ impl eframe::App for CascadingTimersApp {
                                     ),
                                 );
                                 ui.spacing_mut().button_padding = old_pad;
-                                rand_x = Some(cb.rect.min.x);
+                                // Checkbox rect runs from the box's left edge to the
+                                // end of the "Intervals" text — the span the switch
+                                // group below centers on.
+                                rand_span = Some((cb.rect.min.x, cb.rect.max.x));
                                 if cb.changed() {
                                     self.set_randomize(rnd);
                                     geo_changed = true;
@@ -1861,6 +1871,7 @@ impl eframe::App for CascadingTimersApp {
                                     let te = egui::TextEdit::singleline(&mut self.input_sigma)
                                         .text_color(sigma_color)
                                         .horizontal_align(egui::Align::Center)
+                                        .margin(SMALL_BOX_MARGIN)
                                         .interactive(sigma_enabled);
                                     let r = ui.add_sized([56.0, row_h - 2.0], te);
                                     // The σ hint is painted by hand rather than via
@@ -1915,17 +1926,36 @@ impl eframe::App for CascadingTimersApp {
                                     self.config.save();
                                 }
 
-                                // Distribution switch: uniform ⇄ gaussian, aligned
-                                // under the Randomize Intervals checkbox above.
-                                if let Some(x) = rand_x {
-                                    let pad = x - ui.cursor().min.x - ui.spacing().item_spacing.x;
+                                // Distribution switch: uniform ⇄ gaussian, centered
+                                // under the Randomize Intervals checkbox above (box
+                                // left edge through the end of "Intervals").
+                                let switch_enabled = !cohort_live;
+                                let label_color =
+                                    if switch_enabled { TEXT_WHITE } else { TEXT_DIM };
+                                let label_font = egui::FontId::proportional(8.5);
+                                if let Some((x0, x1)) = rand_span {
+                                    let label_w = |s: &str| {
+                                        ui.fonts(|f| {
+                                            f.layout_no_wrap(s.into(), label_font.clone(), label_color)
+                                                .size()
+                                                .x
+                                        })
+                                    };
+                                    let sp = ui.spacing().item_spacing.x;
+                                    let group_w = label_w("uniform")
+                                        + sp
+                                        + TOGGLE_SWITCH_SIZE.x
+                                        + sp
+                                        + label_w("gaussian");
+                                    let left = (x0 + x1 - group_w) / 2.0;
+                                    // The cursor already sits past the item spacing
+                                    // that follows the previous checkbox, so the
+                                    // next widget lands exactly at cursor + pad.
+                                    let pad = left - ui.cursor().min.x;
                                     if pad > 0.0 {
                                         ui.add_space(pad);
                                     }
                                 }
-                                let switch_enabled = !cohort_live;
-                                let label_color =
-                                    if switch_enabled { TEXT_WHITE } else { TEXT_DIM };
                                 ui.label(
                                     egui::RichText::new("uniform").color(label_color).size(8.5),
                                 );
