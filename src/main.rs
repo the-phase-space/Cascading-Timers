@@ -1858,17 +1858,26 @@ impl eframe::App for CascadingTimersApp {
                                     let sigma_enabled = !cohort_live;
                                     let sigma_color =
                                         if sigma_enabled { TEXT_WHITE } else { DISABLED_BORDER };
-                                    // σ glyph reads small at the default 12.5 body
-                                    // size, so the hint alone is bumped one point.
                                     let te = egui::TextEdit::singleline(&mut self.input_sigma)
-                                        .hint_text(
-                                            egui::RichText::new(if sigma_enabled { "σ" } else { "" })
-                                                .size(13.5),
-                                        )
                                         .text_color(sigma_color)
                                         .horizontal_align(egui::Align::Center)
                                         .interactive(sigma_enabled);
                                     let r = ui.add_sized([56.0, row_h - 2.0], te);
+                                    // The σ hint is painted by hand rather than via
+                                    // hint_text: it reads small at the default 12.5
+                                    // body size (so it's bumped one point), and
+                                    // having no ascender its visual mass sits below
+                                    // "ratio" in the sibling box, so it's nudged up
+                                    // a touch. Typed digits keep the stock position.
+                                    if sigma_enabled && self.input_sigma.is_empty() {
+                                        ui.painter().text(
+                                            r.rect.center() - egui::vec2(0.0, 1.5),
+                                            egui::Align2::CENTER_CENTER,
+                                            "σ",
+                                            egui::FontId::proportional(13.5),
+                                            ui.visuals().weak_text_color(),
+                                        );
+                                    }
                                     let (_, unit_name) = duration_unit(&self.input_duration);
                                     let r = r.on_hover_text(format!(
                                         "Std. deviation of each gap, in {unit_name} \
